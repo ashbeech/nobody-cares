@@ -28,10 +28,10 @@ struct OnboardingView: View {
 
     @State private var step: OnboardingStep = .welcome
     @State private var isProcessing = false
+    @State private var loadingMessage: String = ""
+    @State private var hourglassFlipped = false
     @State private var errorMessage: String?
     @State private var showError = false
-    @State private var captchaToken: String?
-    @State private var showCaptcha = false
 
     var body: some View {
         ZStack {
@@ -41,21 +41,30 @@ struct OnboardingView: View {
             VStack(spacing: 0) {
                 Spacer()
 
-                // Logo (on welcome screen)
-                if step == .welcome {
-                    Text("NOBODY CARES")
-                        .font(NCFont.display(28))
-                        .foregroundColor(NCColor.ink)
-                        .tracking(2)
-                        .padding(.bottom, 32)
-                }
+                if isProcessing {
+                    // Loading state — hourglass + status message
+                    onboardingLoadingView
+                        .padding(.horizontal, 24)
+                        .transition(.opacity)
+                } else {
+                    // Logo (on welcome screen)
+                    if step == .welcome {
+                        Text("NOBODY CARES")
+                            .font(NCFont.display(28))
+                            .foregroundColor(NCColor.ink)
+                            .tracking(2)
+                            .padding(.bottom, 32)
+                    }
 
-                // Dialog for current step
-                currentStepDialog
-                    .padding(.horizontal, 24)
+                    // Dialog for current step
+                    currentStepDialog
+                        .padding(.horizontal, 24)
+                        .transition(.opacity)
+                }
 
                 Spacer()
             }
+            .animation(.linear(duration: 0.15), value: isProcessing)
         }
         .onChange(of: permissionService.locationStatus) { _, newStatus in
             if step == .location && newStatus != .notDetermined {
@@ -67,22 +76,6 @@ struct OnboardingView: View {
                 }
             }
         }
-        .overlay {
-            if showCaptcha {
-                CaptchaChallengeView(
-                    onToken: { token in
-                        showCaptcha = false
-                        finalizeRegistration(captchaToken: token)
-                    },
-                    onDismiss: {
-                        showCaptcha = false
-                        isProcessing = false
-                    }
-                )
-                .transition(.move(edge: .bottom))
-            }
-        }
-        .animation(.linear(duration: 0.2), value: showCaptcha)
         .retroDialog(isPresented: $showError) {
             RetroDialog(
                 title: "ERROR",
@@ -256,6 +249,38 @@ struct OnboardingView: View {
         }
     }
 
+    // MARK: - Loading View
+
+    private var onboardingLoadingView: some View {
+        RetroWindow(title: "PROCESSING") {
+            VStack(spacing: 20) {
+                PixelIcon(
+                    type: .hourglass,
+                    size: 36,
+                    color: NCColor.ink
+                )
+                .rotationEffect(.degrees(hourglassFlipped ? 180 : 0))
+                .onAppear { startHourglassAnimation() }
+
+                Text(loadingMessage)
+                    .font(NCFont.dialogBody)
+                    .foregroundColor(NCColor.ink)
+                    .lineSpacing(4)
+                    .multilineTextAlignment(.center)
+                    .animation(.none, value: loadingMessage)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(NCMetrics.dialogPadding)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private func startHourglassAnimation() {
+        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            hourglassFlipped.toggle()
+        }
+    }
+
     // MARK: - Navigation
 
     private func advanceStep() {
@@ -272,23 +297,24 @@ struct OnboardingView: View {
 
     private func completeOnboarding() {
         guard !isProcessing else { return }
+        loadingMessage = "Locating you on the planet\u{2026}\nThe satellite has been informed of your existence."
         isProcessing = true
 
-        // Show captcha challenge to get a Turnstile token before sign-in
-        showCaptcha = true
-    }
-
-    /// Called after CAPTCHA token is obtained (or skipped in dev)
-    private func finalizeRegistration(captchaToken: String?) {
         Task {
             do {
                 // 1. Get current location for registration
                 let location = await permissionService.fetchCurrentLocation()
 
-                // 2. Create anonymous auth session with CAPTCHA token
-                try await authService.signInAnonymously(captchaToken: captchaToken)
+                // 2. Create anonymous auth session
+                await MainActor.run {
+                    loadingMessage = "Generating anonymous identity\u{2026}\nYou were already nobody. We\u{2019}re making it official."
+                }
+                try await authService.signInAnonymously()
 
                 // 3. Register user profile with location
+                await MainActor.run {
+                    loadingMessage = "Filing your paperwork\u{2026}\nYour application for irrelevance is being processed."
+                }
                 try await authService.registerUser(
                     latitude: location?.coordinate.latitude,
                     longitude: location?.coordinate.longitude
@@ -296,6 +322,9 @@ struct OnboardingView: View {
 
                 // 4. Perform App Attest (silently, non-blocking for onboarding)
                 //    Attestation failure on simulator/debug is expected and handled.
+                await MainActor.run {
+                    loadingMessage = "Verifying device authenticity\u{2026}\nConfirming your hardware is real. Unlike your future content."
+                }
                 do {
                     try await appAttestService.performAttestation()
                 } catch {
@@ -307,6 +336,12 @@ struct OnboardingView: View {
 
                 // 5. Update app state
                 await MainActor.run {
+                    loadingMessage = "Preparing your personalised void\u{2026}"
+                }
+                // Brief pause so the user can read the final message
+                try? await Task.sleep(for: .milliseconds(600))
+
+                await MainActor.run {
                     appState.isAuthenticated = true
                     appState.username = authService.username
                     appState.userId = authService.userId
@@ -317,7 +352,6 @@ struct OnboardingView: View {
                     errorMessage = "Registration failed. The void is not accepting new members at this time."
                     showError = true
                     isProcessing = false
-                    showCaptcha = false
                 }
             }
         }
