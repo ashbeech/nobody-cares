@@ -36,7 +36,7 @@ struct LoadingFeedView: View {
                 .tracking(0.5)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(NCColor.background)
+        .background(Color.clear)
     }
 
     private func startHourglassAnimation() {

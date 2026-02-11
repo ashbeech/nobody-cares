@@ -20,6 +20,7 @@ struct ContentCardView: View {
     let item: ContentItem
     let isMuted: Bool
     let isPaused: Bool
+    var currentUserId: UUID? = nil
     let onToggleMute: () -> Void
     let onReport: () -> Void
     let onBlock: () -> Void
@@ -121,14 +122,17 @@ struct ContentCardView: View {
             Spacer()
             HStack {
                 VStack(alignment: .leading, spacing: 0) {
-                    tooltipButton(title: "BLOCK @\(item.username.uppercased())", icon: .block) {
-                        showUserActions = false
-                        onBlock()
-                    }
+                    // Only show block option when it's not the user's own content
+                    if item.userId != currentUserId {
+                        tooltipButton(title: "BLOCK @\(item.username.uppercased())", icon: .block) {
+                            showUserActions = false
+                            onBlock()
+                        }
 
-                    Rectangle()
-                        .fill(Color.white.opacity(0.2))
-                        .frame(height: 1)
+                        Rectangle()
+                            .fill(Color.white.opacity(0.2))
+                            .frame(height: 1)
+                    }
 
                     tooltipButton(title: "REPORT CONTENT", icon: .flag) {
                         showUserActions = false
@@ -218,46 +222,86 @@ struct ContentCardView: View {
     }
 }
 
-// MARK: - Video Player View
+// MARK: - Video Player View (AVPlayerLayer — no built-in gesture handling)
 
-struct VideoPlayerView: UIViewControllerRepresentable {
+struct VideoPlayerView: UIViewRepresentable {
     let url: URL
     let isMuted: Bool
     let isPaused: Bool
 
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        let playerVC = AVPlayerViewController()
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context: Context) -> PlayerContainerView {
+        let view = PlayerContainerView()
         let player = AVPlayer(url: url)
         player.isMuted = isMuted
+        view.player = player
 
-        NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: player.currentItem,
-            queue: .main
-        ) { _ in
-            player.seek(to: .zero)
-            player.play()
-        }
-
-        playerVC.player = player
-        playerVC.showsPlaybackControls = false
-        playerVC.videoGravity = .resizeAspectFill
-        playerVC.view.backgroundColor = .black
+        context.coordinator.player = player
+        context.coordinator.observeLoop(player: player)
 
         if !isPaused {
             player.play()
         }
 
-        return playerVC
+        return view
     }
 
-    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
-        uiViewController.player?.isMuted = isMuted
+    func updateUIView(_ uiView: PlayerContainerView, context: Context) {
+        uiView.player?.isMuted = isMuted
 
         if isPaused {
-            uiViewController.player?.pause()
+            uiView.player?.pause()
         } else {
-            uiViewController.player?.play()
+            uiView.player?.play()
         }
+    }
+
+    class Coordinator {
+        var player: AVPlayer?
+        private var loopObserver: NSObjectProtocol?
+
+        func observeLoop(player: AVPlayer) {
+            loopObserver = NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemDidPlayToEndTime,
+                object: player.currentItem,
+                queue: .main
+            ) { [weak player] _ in
+                player?.seek(to: .zero)
+                player?.play()
+            }
+        }
+
+        deinit {
+            if let observer = loopObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+        }
+    }
+}
+
+// MARK: - Player Container (AVPlayerLayer — touch-transparent)
+
+class PlayerContainerView: UIView {
+    override static var layerClass: AnyClass { AVPlayerLayer.self }
+
+    private var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+
+    var player: AVPlayer? {
+        get { playerLayer.player }
+        set { playerLayer.player = newValue }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        playerLayer.videoGravity = .resizeAspectFill
+        backgroundColor = .black
+        isUserInteractionEnabled = false
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 }

@@ -74,7 +74,10 @@ struct RetroButtonStyle: ButtonStyle {
 
     private var shadowColor: Color {
         guard isEnabled else { return .clear }
-        return NCColor.shadow
+        switch variant {
+        case .primary:   return Color(hex: 0x1A1A1A)   // Near-black — matches dark fill
+        case .secondary: return NCColor.shadow          // Subtle — matches body text shadow
+        }
     }
 
     private var shadowX: CGFloat {
@@ -103,11 +106,21 @@ struct RetroButton: View {
     let title: String
     let variant: RetroButtonVariant
     var isEnabled: Bool = true
+    var trailingIcon: PixelIconType? = nil
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            Text(title)
+            HStack(spacing: 8) {
+                Text(title)
+                if let icon = trailingIcon {
+                    PixelIcon(
+                        type: icon,
+                        size: 14,
+                        color: variant == .primary ? NCColor.accentYellow : NCColor.ink
+                    )
+                }
+            }
         }
         .retroButtonStyle(variant, isEnabled: isEnabled)
         .disabled(!isEnabled)

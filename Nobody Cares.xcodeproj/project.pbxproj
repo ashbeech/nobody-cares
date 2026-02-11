@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		5E44450C2F3D1A93009945F8 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = 5E8552012F3CB00000D97358 /* Supabase */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		5E8551C12F3CADDB00D97358 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +56,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5E44450C2F3D1A93009945F8 /* Supabase in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -196,11 +201,11 @@
 			);
 			mainGroup = 5E8551AA2F3CADD900D97358;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
-			productRefGroup = 5E8551B42F3CADD900D97358 /* Products */;
 			packageReferences = (
 				5E8552002F3CB00000D97358 /* XCRemoteSwiftPackageReference "supabase-swift" */,
 			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 5E8551B42F3CADD900D97358 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -404,11 +409,11 @@
 				DEVELOPMENT_TEAM = 653BNKDSZS;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
-				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required to produce content.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "We need to know where you are to show you nearby content.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Microphone access allows audio capture with video content.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
@@ -435,11 +440,11 @@
 				DEVELOPMENT_TEAM = 653BNKDSZS;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
-				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required to produce content.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "We need to know where you are to show you nearby content.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Microphone access allows audio capture with video content.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;

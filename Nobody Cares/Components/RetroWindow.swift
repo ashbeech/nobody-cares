@@ -55,17 +55,8 @@ struct RetroWindow<Content: View>: View {
             // Close box
             if showCloseBox {
                 HStack {
-                    Button(action: { onClose?() }) {
-                        Rectangle()
-                            .stroke(NCColor.ink, lineWidth: 1.5)
-                            .frame(
-                                width: NCMetrics.closeBoxSize,
-                                height: NCMetrics.closeBoxSize
-                            )
-                            .background(NCColor.background)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.leading, 6)
+                    RetroCloseBox { onClose?() }
+                        .padding(.leading, 6)
                     Spacer()
                 }
             }

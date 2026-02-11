@@ -5,11 +5,11 @@
 //  The feed tab — full-screen, location-gated content display.
 //
 //  Interactions (per spec Section 9):
-//  - Vertical swipe up: next content
-//  - Vertical swipe down: previous content
-//  - Press and hold: pause auto-advance
+//  - Vertical swipe up/down: navigate content with TikTok-style finger tracking
+//  - Press and hold: pause all playback and auto-advance
 //  - Tap: toggle mute (video only)
 //  - 6-second auto-advance with yellow progress bar in tab bar
+//  - Pull-to-refresh at first item
 //  - Report, block, and share actions
 //
 
@@ -23,6 +23,22 @@ struct FeedView: View {
     @State private var showBlockConfirm = false
     @State private var blockItem: ContentItem?
     @State private var showBlockedBanner = false
+
+    // TikTok-style scroll state
+    @State private var dragOffset: CGFloat = 0
+    @State private var isTransitioning = false
+
+    // Hold-to-pause state (auto-resets when gesture ends)
+    @GestureState private var isLongPressing = false
+
+    // EndOfFeed drag state
+    @State private var endOfFeedDragOffset: CGFloat = 0
+
+    // Constants
+    private let pullThreshold: CGFloat = 100
+    private let swipeThreshold: CGFloat = 50
+    private let animationDuration: Double = 0.3
+
     var onMakeContent: () -> Void = {}
 
     var body: some View {
@@ -43,10 +59,7 @@ struct FeedView: View {
                     contentView
 
                 case .endOfFeed:
-                    EndOfFeedView(
-                        onMakeContent: onMakeContent,
-                        onRefresh: { viewModel.refresh() }
-                    )
+                    endOfFeedWithGesture
 
                 case .error(let message):
                     errorView(message)
@@ -86,6 +99,15 @@ struct FeedView: View {
         .onChange(of: viewModel.isPaused) { _, newValue in
             appState.isFeedPaused = newValue
         }
+        .onChange(of: isLongPressing) { _, pressing in
+            viewModel.setPaused(pressing)
+        }
+        .onChange(of: viewModel.feedState) { _, newState in
+            if newState != .content {
+                dragOffset = 0
+                isTransitioning = false
+            }
+        }
         .retroDialog(isPresented: $showBlockConfirm) {
             RetroDialog(
                 title: "BLOCK USER",
@@ -112,71 +134,259 @@ struct FeedView: View {
         switch viewModel.feedState {
         case .content:
             Color.black
-        case .empty, .endOfFeed, .error, .loading:
-            NCColor.background
+        default:
+            // Animated dither — persistent background for all non-media states
+            DitherPatternView(
+                style: .light,
+                foreground: NCColor.dither,
+                background: NCColor.background,
+                animated: true
+            )
         }
     }
 
-    // MARK: - Content View
+    // MARK: - Content View (TikTok-style vertical scroll)
 
     private var contentView: some View {
-        ZStack {
-            if let item = viewModel.currentItem {
-                ContentCardView(
-                    item: item,
-                    isMuted: viewModel.isMuted,
-                    isPaused: viewModel.isPaused,
-                    onToggleMute: { viewModel.toggleMute() },
-                    onReport: {
-                        reportContentId = item.id
-                        showReport = true
-                    },
-                    onBlock: {
-                        blockItem = item
-                        showBlockConfirm = true
-                    },
-                    onShare: {
-                        shareContent(item)
-                    }
-                )
-                .id(item.id)
-                .transition(.opacity)
+        GeometryReader { geometry in
+            let screenHeight = geometry.size.height
+
+            ZStack {
+                // Pull-to-refresh background and indicator (above first item)
+                if viewModel.currentIndex == 0 && dragOffset > 0 {
+                    pullToRefreshArea(in: geometry)
+                }
+
+                // Previous item peeking above
+                if viewModel.currentIndex > 0 {
+                    peekCard(for: viewModel.items[viewModel.currentIndex - 1], in: geometry)
+                        .frame(width: geometry.size.width, height: screenHeight)
+                        .offset(y: dragOffset - screenHeight)
+                }
+
+                // Current item
+                if let item = viewModel.currentItem {
+                    ContentCardView(
+                        item: item,
+                        isMuted: viewModel.isMuted,
+                        isPaused: viewModel.isPaused,
+                        currentUserId: appState.userId,
+                        onToggleMute: { viewModel.toggleMute() },
+                        onReport: {
+                            reportContentId = item.id
+                            showReport = true
+                        },
+                        onBlock: {
+                            blockItem = item
+                            showBlockConfirm = true
+                        },
+                        onShare: {
+                            shareContent(item)
+                        }
+                    )
+                    .id(item.id)
+                    .frame(width: geometry.size.width, height: screenHeight)
+                    .offset(y: dragOffset)
+                }
+
+                // Next item or EndOfFeed peeking below
+                if viewModel.currentIndex < viewModel.items.count - 1 {
+                    peekCard(for: viewModel.items[viewModel.currentIndex + 1], in: geometry)
+                        .frame(width: geometry.size.width, height: screenHeight)
+                        .offset(y: dragOffset + screenHeight)
+                } else {
+                    EndOfFeedView(
+                        onMakeContent: onMakeContent,
+                        onRefresh: { viewModel.refresh() }
+                    )
+                    .frame(width: geometry.size.width, height: screenHeight)
+                    .offset(y: dragOffset + screenHeight)
+                }
             }
         }
+        .clipped()
         .gesture(swipeGesture)
-        .simultaneousGesture(longPressGesture)
-        .animation(.linear(duration: 0.15), value: viewModel.currentIndex)
+        .simultaneousGesture(holdGesture)
     }
 
-    // MARK: - Swipe Gesture
+    // MARK: - Peek Card (lightweight preview for adjacent items)
+
+    @ViewBuilder
+    private func peekCard(for item: ContentItem, in geometry: GeometryProxy) -> some View {
+        ZStack {
+            Color.black
+            if item.contentType == .image, let url = item.signedURL {
+                AsyncImage(url: url) { phase in
+                    if case .success(let image) = phase {
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: geometry.size.width, height: geometry.size.height)
+                            .clipped()
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Pull-to-Refresh Area
+
+    private func pullToRefreshArea(in geometry: GeometryProxy) -> some View {
+        let screenHeight = geometry.size.height
+        let progress = min(dragOffset / (pullThreshold * 0.5), 1.5)
+
+        return ZStack {
+            // Dither background for the revealed gap
+            DitherPatternView(
+                style: .light,
+                foreground: NCColor.dither,
+                background: NCColor.background,
+                animated: true
+            )
+
+            // Hourglass indicator
+            VStack(spacing: 8) {
+                PixelIcon(type: .hourglass, size: 28, color: NCColor.ink)
+                    .rotationEffect(.degrees(progress * 180))
+                    .scaleEffect(0.5 + min(progress, 1.0) * 0.5)
+
+                if progress >= 1.0 {
+                    Text("RELEASE TO REFRESH")
+                        .font(NCFont.caption)
+                        .foregroundColor(NCColor.ink)
+                        .tracking(0.3)
+                        .transition(.opacity)
+                }
+            }
+        }
+        .frame(width: geometry.size.width, height: max(1, dragOffset))
+        .offset(y: -(screenHeight - dragOffset) / 2)
+    }
+
+    // MARK: - Swipe Gesture (TikTok-style finger tracking)
 
     private var swipeGesture: some Gesture {
-        DragGesture(minimumDistance: 50, coordinateSpace: .local)
-            .onEnded { value in
-                let verticalDistance = value.translation.height
+        DragGesture(minimumDistance: 20, coordinateSpace: .local)
+            .onChanged { value in
+                guard !isTransitioning else { return }
+                let translation = value.translation.height
 
-                if verticalDistance < -50 {
-                    viewModel.advanceToNext()
-                    if viewModel.feedState == .content {
-                        viewModel.startAutoAdvance()
+                if viewModel.currentIndex == 0 && translation > 0 {
+                    // Pull-to-refresh: rubber band effect at top
+                    dragOffset = translation * 0.5
+                } else {
+                    dragOffset = translation
+                }
+            }
+            .onEnded { value in
+                guard !isTransitioning else { return }
+                let translation = value.translation.height
+                let velocity = value.predictedEndTranslation.height - translation
+                let screenHeight = UIScreen.main.bounds.height
+
+                // Pull-to-refresh (at first item, pulled past threshold)
+                if viewModel.currentIndex == 0 && translation > pullThreshold {
+                    withAnimation(.easeOut(duration: animationDuration)) {
+                        dragOffset = 0
                     }
-                } else if verticalDistance > 50 {
-                    viewModel.goToPrevious()
-                    viewModel.startAutoAdvance()
+                    viewModel.refresh()
+                    return
+                }
+
+                let shouldAdvance = translation < -swipeThreshold || velocity < -300
+                let shouldGoBack = translation > swipeThreshold || velocity > 300
+
+                if shouldAdvance {
+                    isTransitioning = true
+                    withAnimation(.easeOut(duration: animationDuration)) {
+                        dragOffset = -screenHeight
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
+                        viewModel.advanceToNext()
+                        if viewModel.feedState == .content {
+                            dragOffset = 0
+                            viewModel.startAutoAdvance()
+                        }
+                        isTransitioning = false
+                    }
+                } else if shouldGoBack && viewModel.currentIndex > 0 {
+                    isTransitioning = true
+                    withAnimation(.easeOut(duration: animationDuration)) {
+                        dragOffset = screenHeight
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
+                        viewModel.goToPrevious()
+                        dragOffset = 0
+                        viewModel.startAutoAdvance()
+                        isTransitioning = false
+                    }
+                } else {
+                    // Snap back — didn't meet threshold
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        dragOffset = 0
+                    }
                 }
             }
     }
 
-    // MARK: - Long Press Gesture (pause)
+    // MARK: - Hold Gesture (press and hold to pause everything)
 
-    private var longPressGesture: some Gesture {
-        LongPressGesture(minimumDuration: 0.2)
-            .onChanged { _ in
-                viewModel.setPaused(true)
+    private var holdGesture: some Gesture {
+        LongPressGesture(minimumDuration: 0.3)
+            .sequenced(before: DragGesture(minimumDistance: 0))
+            .updating($isLongPressing) { value, state, _ in
+                switch value {
+                case .second(true, _):
+                    state = true
+                default:
+                    break
+                }
             }
-            .onEnded { _ in
-                viewModel.setPaused(false)
-            }
+    }
+
+    // MARK: - EndOfFeed with Gesture (swipe to return to content)
+
+    private var endOfFeedWithGesture: some View {
+        EndOfFeedView(
+            onMakeContent: onMakeContent,
+            onRefresh: { viewModel.refresh() }
+        )
+        .offset(y: endOfFeedDragOffset)
+        .gesture(
+            DragGesture(minimumDistance: 50)
+                .onChanged { value in
+                    endOfFeedDragOffset = value.translation.height
+                }
+                .onEnded { value in
+                    let translation = value.translation.height
+                    let screenHeight = UIScreen.main.bounds.height
+
+                    if translation > 80 && !viewModel.items.isEmpty {
+                        // Swipe down (top to bottom) → go to last content item
+                        withAnimation(.easeOut(duration: animationDuration)) {
+                            endOfFeedDragOffset = screenHeight
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
+                            endOfFeedDragOffset = 0
+                            viewModel.goToLast()
+                        }
+                    } else if translation < -80 && !viewModel.items.isEmpty {
+                        // Swipe up (bottom to top) → go to first content item
+                        withAnimation(.easeOut(duration: animationDuration)) {
+                            endOfFeedDragOffset = -screenHeight
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
+                            endOfFeedDragOffset = 0
+                            viewModel.goToFirst()
+                        }
+                    } else {
+                        // Snap back
+                        withAnimation(.easeOut(duration: animationDuration)) {
+                            endOfFeedDragOffset = 0
+                        }
+                    }
+                }
+        )
     }
 
     // MARK: - Block
@@ -262,20 +472,17 @@ struct FeedView: View {
     // MARK: - Error View
 
     private func errorView(_ message: String) -> some View {
-        ZStack {
-            NCColor.background.ignoresSafeArea()
-
-            RetroDialog(
-                title: "ERROR",
-                icon: .caution,
-                headline: "FEED UNAVAILABLE",
-                body_text: message,
-                primaryAction: .init(title: "RETRY") {
-                    viewModel.refresh()
-                }
-            )
-            .padding(.horizontal, 32)
-        }
+        // Background dither provided by feedBackground
+        RetroDialog(
+            title: "ERROR",
+            icon: .caution,
+            headline: "FEED UNAVAILABLE",
+            body_text: message,
+            primaryAction: .init(title: "RETRY") {
+                viewModel.refresh()
+            }
+        )
+        .padding(.horizontal, 32)
     }
 }
 
