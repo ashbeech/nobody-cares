@@ -41,7 +41,7 @@ struct EndOfFeedView: View {
 
                     HStack(spacing: 12) {
                         Spacer()
-                        RetroButton(title: "REFRESH", variant: .secondary) {
+                        RetroButton(title: "REFRESH", variant: .secondary, trailingIcon: .recycle) {
                             onRefresh()
                         }
                         RetroButton(title: "MAKE CONTENT", variant: .primary) {

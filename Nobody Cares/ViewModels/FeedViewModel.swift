@@ -249,6 +249,22 @@ final class FeedViewModel {
         isMuted.toggle()
     }
 
+    func goToFirst() {
+        guard !items.isEmpty else { return }
+        currentIndex = 0
+        progress = 0.0
+        feedState = .content
+        startAutoAdvance()
+    }
+
+    func goToLast() {
+        guard !items.isEmpty else { return }
+        currentIndex = items.count - 1
+        progress = 0.0
+        feedState = .content
+        startAutoAdvance()
+    }
+
     func setPaused(_ paused: Bool) {
         isPaused = paused
     }

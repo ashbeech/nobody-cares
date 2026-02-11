@@ -23,6 +23,7 @@ enum PixelIconType: String {
     case hourglass      // Loading
     case caution        // Warning / alert
     case lock           // Access denied
+    case recycle        // Refresh / recycle
 
     /// SF Symbol name (placeholder until custom pixel art is bundled)
     var symbolName: String {
@@ -41,6 +42,7 @@ enum PixelIconType: String {
         case .hourglass:     return "hourglass"
         case .caution:       return "exclamationmark.triangle"
         case .lock:          return "lock"
+        case .recycle:       return "arrow.2.circlepath"
         }
     }
 }
