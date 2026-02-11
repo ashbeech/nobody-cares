@@ -67,13 +67,15 @@ struct OnboardingView: View {
             .animation(.linear(duration: 0.15), value: isProcessing)
         }
         .onChange(of: permissionService.locationStatus) { _, newStatus in
-            if step == .location && newStatus != .notDetermined {
-                if permissionService.isLocationAuthorized {
-                    advanceStep()
-                } else {
-                    errorMessage = "LOCATION DENIED. Without location access, this app is an empty room. Which, to be fair, it mostly is anyway."
-                    showError = true
-                }
+            guard step == .location else { return }
+            if permissionService.isLocationAuthorized {
+                // Granted (including after returning from Settings)
+                showError = false
+                advanceStep()
+            } else if newStatus != .notDetermined {
+                // Denied or restricted
+                errorMessage = "LOCATION DENIED. Without location access, this app is an empty room. Which, to be fair, it mostly is anyway.\n\nOpen Settings and grant location access, or get back to Facebook."
+                showError = true
             }
         }
         .retroDialog(isPresented: $showError) {
@@ -86,9 +88,6 @@ struct OnboardingView: View {
                     if let url = URL(string: UIApplication.openSettingsURLString) {
                         UIApplication.shared.open(url)
                     }
-                    showError = false
-                },
-                secondaryAction: .init(title: "DISMISS") {
                     showError = false
                 }
             )

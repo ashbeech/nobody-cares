@@ -66,6 +66,14 @@ final class PermissionService {
         locationManager.requestWhenInUseAuthorization()
     }
 
+    /// Re-read the current authorization status from the system.
+    /// Call this when the app returns from background or Settings.
+    func refreshLocationStatus() {
+        locationStatus = locationManager.authorizationStatus
+        cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
+        microphoneStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+    }
+
     func requestCameraPermission() async -> Bool {
         let granted = await AVCaptureDevice.requestAccess(for: .video)
         await MainActor.run {

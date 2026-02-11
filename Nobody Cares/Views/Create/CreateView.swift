@@ -71,12 +71,16 @@ struct CreateView: View {
         .onAppear {
             appState.isCameraActive = true
             // Start location updates so a fix is cached by capture time
-            permissionService.startUpdatingLocation()
+            if permissionService.isLocationAuthorized {
+                permissionService.startUpdatingLocation()
+            }
             AnalyticsService.shared.track(.cameraOpened)
         }
         .onDisappear {
             appState.isCameraActive = false
-            permissionService.stopUpdatingLocation()
+            if permissionService.isLocationAuthorized {
+                permissionService.stopUpdatingLocation()
+            }
             stopRecordingCleanup()
             uploadTask?.cancel()
         }
@@ -236,8 +240,15 @@ struct CreateView: View {
     // MARK: - Handle Capture Results
 
     private func handleCaptureResult(_ result: CaptureResult) {
+        print("[Upload] handleCaptureResult called, type: \(result)")
         uploadTask = Task { @MainActor in
             do {
+                // Check location permission first
+                guard permissionService.isLocationAuthorized else {
+                    print("[Upload] Location permission not granted (status: \(permissionService.locationStatus.rawValue))")
+                    throw CaptureError.locationPermissionDenied
+                }
+
                 // Get current location (10s timeout)
                 print("[Upload] Requesting location...")
                 guard let location = await permissionService.fetchCurrentLocation() else {
@@ -312,6 +323,9 @@ struct CreateView: View {
     private func mapCaptureError(_ error: Error) -> String {
         if let captureError = error as? CaptureError {
             switch captureError {
+            case .locationPermissionDenied:
+                AnalyticsService.shared.track(.locationUnavailable)
+                return "LOCATION ACCESS DENIED. Open Settings → Nobody Cares → Location and select 'While Using the App'."
             case .noLocation:
                 AnalyticsService.shared.track(.locationUnavailable)
                 return "NO SIGNAL. CONTENT IS PATIENT. Move to a location with GPS signal and try again."
@@ -365,6 +379,7 @@ struct CreateView: View {
 // MARK: - Capture Errors
 
 enum CaptureError: Error {
+    case locationPermissionDenied
     case noLocation
     case poorAccuracy(Double)
     case fileTooLarge

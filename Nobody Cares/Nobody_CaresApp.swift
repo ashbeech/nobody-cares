@@ -14,6 +14,7 @@ struct Nobody_CaresApp: App {
     @State private var permissionService = PermissionService()
     @State private var apiGuard = APIGuard()
     @State private var appAttestService = AppAttestService()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -29,6 +30,13 @@ struct Nobody_CaresApp: App {
                 }
                 .onOpenURL { url in
                     handleDeepLink(url)
+                }
+                .onChange(of: scenePhase) { _, newPhase in
+                    if newPhase == .active {
+                        // Recheck permissions every time app becomes active
+                        // (catches Settings changes, "Allow Once" expiry, etc.)
+                        permissionService.refreshLocationStatus()
+                    }
                 }
         }
     }
@@ -46,8 +54,11 @@ struct Nobody_CaresApp: App {
         } else if !appState.hasCompletedOnboarding {
             // First launch — onboarding flow
             OnboardingView()
+        } else if !permissionService.isLocationAuthorized {
+            // Location expired ("Allow Once") or revoked — hard gate
+            LocationGateView()
         } else {
-            // Authenticated — main app
+            // Authenticated + location granted — main app
             MainShell()
         }
     }

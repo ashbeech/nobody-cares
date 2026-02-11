@@ -175,9 +175,13 @@ final class CameraPreviewController: UIViewController {
         captureSettings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
 
         let delegate = PhotoCaptureDelegate { [weak self] result in
-            self?.onCapture?(result)
+            DispatchQueue.main.async {
+                self?.onCapture?(result)
+            }
         } onError: { [weak self] error in
-            self?.onError?(error)
+            DispatchQueue.main.async {
+                self?.onError?(error)
+            }
         }
         objc_setAssociatedObject(captureSettings, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
         photoOutput.capturePhoto(with: captureSettings, delegate: delegate)
@@ -194,11 +198,15 @@ final class CameraPreviewController: UIViewController {
             .appendingPathExtension("mov")
 
         let delegate = MovieRecordingDelegate { [weak self] url in
-            self?.isRecording = false
-            self?.onCapture?(.video(url))
+            DispatchQueue.main.async {
+                self?.isRecording = false
+                self?.onCapture?(.video(url))
+            }
         } onError: { [weak self] error in
-            self?.isRecording = false
-            self?.onError?(error)
+            DispatchQueue.main.async {
+                self?.isRecording = false
+                self?.onError?(error)
+            }
         }
 
         // Retain delegate
@@ -235,12 +243,14 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
         didFinishProcessingPhoto photo: AVCapturePhoto,
         error: Error?
     ) {
+        print("[Camera] Photo delegate fired, error: \(error?.localizedDescription ?? "none")")
         if let error {
             onError("Photo capture failed: \(error.localizedDescription)")
             return
         }
 
         guard let data = photo.fileDataRepresentation() else {
+            print("[Camera] Failed to get photo data representation")
             onError("Failed to get photo data")
             return
         }
@@ -249,6 +259,7 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
         let isHEIF = photo.resolvedSettings.photoProcessingTimeRange.duration != .zero
             || String(describing: type(of: photo)).contains("HEIF")
 
+        print("[Camera] Photo captured: \(data.count) bytes, isHEIF: \(isHEIF)")
         onResult(.photo(data, isHEIF: isHEIF))
     }
 }
