@@ -2,14 +2,18 @@
 //  APIGuard.swift
 //  Nobody Cares
 //
-//  Wraps sensitive API calls with rate limit checking, CAPTCHA escalation,
-//  and ban detection. This is the client-side enforcement layer.
+//  Wraps sensitive API calls with rate limit checking, trust score
+//  enforcement, and ban detection. This is the client-side enforcement layer.
+//
+//  Server-side enforcement (attestation, IP rate limits) is authoritative.
+//  This guard provides early rejection on the client to avoid wasted
+//  round-trips and gives the user meaningful feedback.
 //
 //  Flow:
 //  1. Before an API call, check_rate_limit() is called via RPC
 //  2. If "ok" → proceed
-//  3. If "soft_exceeded" → require CAPTCHA, then proceed
-//  4. If "hard_exceeded" → decrease trust score, require CAPTCHA
+//  3. If "soft_exceeded" → proceed (server will enforce if needed)
+//  4. If "hard_exceeded" → decrease trust score, reject
 //  5. Ban check happens at initialization and is enforced globally
 //
 
@@ -40,20 +44,14 @@ enum RateLimitResult: String {
 
 enum APIGuardError: Error, LocalizedError {
     case banned
-    case captchaRequired
     case rateLimitExceeded
-    case captchaFailed
 
     var errorDescription: String? {
         switch self {
         case .banned:
             return "YOUR ACCESS HAS BEEN REVOKED. This decision is final. Nobody cares."
-        case .captchaRequired:
-            return "HUMAN VERIFICATION REQUIRED. Prove you are not a machine."
         case .rateLimitExceeded:
             return "RATE LIMIT EXCEEDED. Slow down. The void does not appreciate urgency."
-        case .captchaFailed:
-            return "VERIFICATION FAILED. Suspicious."
         }
     }
 }
@@ -63,9 +61,6 @@ enum APIGuardError: Error, LocalizedError {
 @Observable
 final class APIGuard {
     var isBanned = false
-    var needsCaptcha = false
-    var pendingAction: RateLimitAction?
-    var captchaCompletion: ((String?) -> Void)?
 
     // MARK: - Ban Check
 
@@ -109,7 +104,6 @@ final class APIGuard {
     // MARK: - Guarded Operation
 
     /// Execute an operation with rate limit protection.
-    /// If rate limited, triggers CAPTCHA challenge and waits for resolution.
     /// - Parameters:
     ///   - action: The rate limit action type
     ///   - operation: The actual operation to perform
@@ -127,19 +121,14 @@ final class APIGuard {
             return try await operation()
 
         case .softExceeded:
-            // Require CAPTCHA before proceeding
-            let token = try await requestCaptcha(for: action)
-            // CAPTCHA solved — proceed with operation
-            // Token is validated server-side on the next auth refresh
-            _ = token
+            // Soft limit: proceed but the server may enforce stricter checks.
+            // App Attest assertions are the real gate — not CAPTCHA.
             return try await operation()
 
         case .hardExceeded:
-            // Decrease trust score, then require CAPTCHA
+            // Hard limit: decrease trust score and reject
             try await decreaseTrustScore(amount: 5, reason: "rate_limit_hard_exceeded")
-            let token = try await requestCaptcha(for: action)
-            _ = token
-            return try await operation()
+            throw APIGuardError.rateLimitExceeded
         }
     }
 
@@ -164,34 +153,6 @@ final class APIGuard {
                 isBanned = true
             }
         }
-    }
-
-    // MARK: - CAPTCHA Flow
-
-    /// Request a CAPTCHA challenge. Returns the token when solved.
-    /// This triggers the UI to show the CaptchaChallengeView.
-    @MainActor
-    private func requestCaptcha(for action: RateLimitAction) async throws -> String {
-        return try await withCheckedThrowingContinuation { continuation in
-            pendingAction = action
-            needsCaptcha = true
-            captchaCompletion = { token in
-                if let token {
-                    continuation.resume(returning: token)
-                } else {
-                    continuation.resume(throwing: APIGuardError.captchaFailed)
-                }
-            }
-        }
-    }
-
-    /// Called by the CAPTCHA view when the user solves it (or fails).
-    @MainActor
-    func resolveCaptcha(token: String?) {
-        captchaCompletion?(token)
-        captchaCompletion = nil
-        pendingAction = nil
-        needsCaptcha = false
     }
 }
 

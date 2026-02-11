@@ -108,7 +108,11 @@ final class CameraPreviewController: UIViewController {
         // Photo output
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
-            photoOutput.isHighResolutionCaptureEnabled = true
+
+            // Use the highest resolution the active format supports
+            if let maxDimensions = videoDevice.activeFormat.supportedMaxPhotoDimensions.last {
+                photoOutput.maxPhotoDimensions = maxDimensions
+            }
         }
 
         // Movie output
@@ -158,29 +162,25 @@ final class CameraPreviewController: UIViewController {
         let settings = AVCapturePhotoSettings()
 
         // Prefer HEIF, fall back to JPEG
+        let captureSettings: AVCapturePhotoSettings
         if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
-            let heifSettings = AVCapturePhotoSettings(format: [
+            captureSettings = AVCapturePhotoSettings(format: [
                 AVVideoCodecKey: AVVideoCodecType.hevc
             ])
-            heifSettings.isHighResolutionPhotoEnabled = true
-            let delegate = PhotoCaptureDelegate { [weak self] result in
-                self?.onCapture?(result)
-            } onError: { [weak self] error in
-                self?.onError?(error)
-            }
-            // Retain delegate via associated object
-            objc_setAssociatedObject(heifSettings, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
-            photoOutput.capturePhoto(with: heifSettings, delegate: delegate)
         } else {
-            settings.isHighResolutionPhotoEnabled = true
-            let delegate = PhotoCaptureDelegate { [weak self] result in
-                self?.onCapture?(result)
-            } onError: { [weak self] error in
-                self?.onError?(error)
-            }
-            objc_setAssociatedObject(settings, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
-            photoOutput.capturePhoto(with: settings, delegate: delegate)
+            captureSettings = settings
         }
+
+        // Request the highest resolution the output supports
+        captureSettings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+
+        let delegate = PhotoCaptureDelegate { [weak self] result in
+            self?.onCapture?(result)
+        } onError: { [weak self] error in
+            self?.onError?(error)
+        }
+        objc_setAssociatedObject(captureSettings, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
+        photoOutput.capturePhoto(with: captureSettings, delegate: delegate)
     }
 
     // MARK: - Video Recording

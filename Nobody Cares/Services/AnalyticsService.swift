@@ -34,8 +34,6 @@ enum AnalyticsEvent: String {
     case gpsInaccurate = "gps_inaccurate"
 
     // Security
-    case captchaShown = "captcha_shown"
-    case captchaSolved = "captcha_solved"
     case rateLimitHit = "rate_limit_hit"
 
     // Deep links
