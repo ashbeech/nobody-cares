@@ -19,6 +19,7 @@ import SwiftUI
 struct CreateView: View {
     @Environment(AppState.self) private var appState
     @Environment(PermissionService.self) private var permissionService
+    @Environment(AppAttestService.self) private var appAttestService
 
     @State private var cameraController: CameraPreviewController?
     @State private var isRecording = false
@@ -28,6 +29,7 @@ struct CreateView: View {
     @State private var isProcessing = false
     @State private var showError = false
     @State private var errorMessage: String?
+    @State private var uploadTask: Task<Void, Never>?
 
     private let maxRecordingDuration: TimeInterval = 6.0
     private let tapThreshold: TimeInterval = 0.3
@@ -46,11 +48,19 @@ struct CreateView: View {
             )
             .ignoresSafeArea()
 
-            // Shutter button overlay
+            // Shutter button + cancel overlay
             VStack {
                 Spacer()
-                shutterButton
-                    .padding(.bottom, 48)
+                HStack(alignment: .bottom) {
+                    Spacer()
+                    shutterButton
+                    Spacer()
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    cancelButton
+                }
+                .padding(.horizontal, NCMetrics.contentPadding)
+                .padding(.bottom, 48)
             }
 
             // Processing overlay
@@ -60,11 +70,19 @@ struct CreateView: View {
         }
         .onAppear {
             appState.isCameraActive = true
+            // Start location updates so a fix is cached by capture time
+            if permissionService.isLocationAuthorized {
+                permissionService.startUpdatingLocation()
+            }
             AnalyticsService.shared.track(.cameraOpened)
         }
         .onDisappear {
             appState.isCameraActive = false
+            if permissionService.isLocationAuthorized {
+                permissionService.stopUpdatingLocation()
+            }
             stopRecordingCleanup()
+            uploadTask?.cancel()
         }
         .retroDialog(isPresented: $showError) {
             RetroDialog(
@@ -78,6 +96,26 @@ struct CreateView: View {
                 }
             )
         }
+    }
+
+    // MARK: - Cancel Button
+
+    private var cancelButton: some View {
+        Button {
+            appState.selectedTab = .feed
+        } label: {
+            Text("CANCEL")
+                .font(NCFont.body(12))
+                .foregroundColor(.white)
+                .tracking(0.5)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.black.opacity(0.55))
+                .retroBorder(color: Color.white.opacity(0.3), width: 1)
+        }
+        .buttonStyle(.plain)
+        .opacity(isProcessing ? 0 : 1)
+        .disabled(isProcessing)
     }
 
     // MARK: - Shutter Button
@@ -202,12 +240,22 @@ struct CreateView: View {
     // MARK: - Handle Capture Results
 
     private func handleCaptureResult(_ result: CaptureResult) {
-        Task { @MainActor in
+        print("[Upload] handleCaptureResult called, type: \(result)")
+        uploadTask = Task { @MainActor in
             do {
-                // Get current location
+                // Check location permission first
+                guard permissionService.isLocationAuthorized else {
+                    print("[Upload] Location permission not granted (status: \(permissionService.locationStatus.rawValue))")
+                    throw CaptureError.locationPermissionDenied
+                }
+
+                // Get current location (10s timeout)
+                print("[Upload] Requesting location...")
                 guard let location = await permissionService.fetchCurrentLocation() else {
                     throw CaptureError.noLocation
                 }
+                try Task.checkCancellation()
+                print("[Upload] Location acquired: \(location.coordinate), accuracy: \(location.horizontalAccuracy)m")
 
                 // Validate accuracy
                 guard location.horizontalAccuracy < 100 else {
@@ -215,6 +263,7 @@ struct CreateView: View {
                 }
 
                 // Process media
+                print("[Upload] Processing media...")
                 let processedMedia: ProcessedMedia
                 switch result {
                 case .photo(let data, _):
@@ -222,14 +271,19 @@ struct CreateView: View {
                 case .video(let url):
                     processedMedia = try await MediaProcessor.processVideo(url: url)
                 }
+                try Task.checkCancellation()
+                print("[Upload] Media processed: \(processedMedia.contentType.rawValue), \(processedMedia.fileSizeBytes) bytes")
 
                 // Upload
+                print("[Upload] Starting upload pipeline...")
                 try await UploadService.shared.upload(
                     media: processedMedia,
                     latitude: location.coordinate.latitude,
                     longitude: location.coordinate.longitude,
-                    horizontalAccuracy: location.horizontalAccuracy
+                    horizontalAccuracy: location.horizontalAccuracy,
+                    appAttest: appAttestService
                 )
+                print("[Upload] Upload complete!")
 
                 // Success — switch to feed, show banner
                 AnalyticsService.shared.track(.contentCreated, metadata: [
@@ -240,7 +294,11 @@ struct CreateView: View {
                 withAnimation(.linear(duration: 0.15)) {
                     appState.showArchivedBanner = true
                 }
+            } catch is CancellationError {
+                print("[Upload] Cancelled by user")
+                isProcessing = false
             } catch {
+                print("[Upload] Failed: \(error)")
                 isProcessing = false
                 errorMessage = mapCaptureError(error)
                 showError = true
@@ -265,6 +323,9 @@ struct CreateView: View {
     private func mapCaptureError(_ error: Error) -> String {
         if let captureError = error as? CaptureError {
             switch captureError {
+            case .locationPermissionDenied:
+                AnalyticsService.shared.track(.locationUnavailable)
+                return "LOCATION ACCESS DENIED. Open Settings → Nobody Cares → Location and select 'While Using the App'."
             case .noLocation:
                 AnalyticsService.shared.track(.locationUnavailable)
                 return "NO SIGNAL. CONTENT IS PATIENT. Move to a location with GPS signal and try again."
@@ -298,6 +359,18 @@ struct CreateView: View {
                     .font(NCFont.display(14))
                     .foregroundColor(.white)
                     .tracking(1)
+
+                Button {
+                    uploadTask?.cancel()
+                    uploadTask = nil
+                    isProcessing = false
+                } label: {
+                    Text("CANCEL")
+                        .font(NCFont.display(12))
+                        .foregroundColor(NCColor.accentYellow)
+                        .tracking(1)
+                        .padding(.top, 8)
+                }
             }
         }
     }
@@ -306,6 +379,7 @@ struct CreateView: View {
 // MARK: - Capture Errors
 
 enum CaptureError: Error {
+    case locationPermissionDenied
     case noLocation
     case poorAccuracy(Double)
     case fileTooLarge

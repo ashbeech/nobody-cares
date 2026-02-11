@@ -13,13 +13,13 @@ struct EndOfFeedView: View {
 
     var body: some View {
         ZStack {
-            // Background dither
+            // Background dither — animated subtle scroll
             DitherPatternView(
                 style: .light,
                 foreground: NCColor.dither,
-                background: NCColor.background
+                background: NCColor.background,
+                animated: true
             )
-            .ignoresSafeArea()
 
             // Warning dialog
             RetroWindow(title: "WARNING", icon: .caution) {

@@ -108,7 +108,11 @@ final class CameraPreviewController: UIViewController {
         // Photo output
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
-            photoOutput.isHighResolutionCaptureEnabled = true
+
+            // Use the highest resolution the active format supports
+            if let maxDimensions = videoDevice.activeFormat.supportedMaxPhotoDimensions.last {
+                photoOutput.maxPhotoDimensions = maxDimensions
+            }
         }
 
         // Movie output
@@ -158,29 +162,29 @@ final class CameraPreviewController: UIViewController {
         let settings = AVCapturePhotoSettings()
 
         // Prefer HEIF, fall back to JPEG
+        let captureSettings: AVCapturePhotoSettings
         if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
-            let heifSettings = AVCapturePhotoSettings(format: [
+            captureSettings = AVCapturePhotoSettings(format: [
                 AVVideoCodecKey: AVVideoCodecType.hevc
             ])
-            heifSettings.isHighResolutionPhotoEnabled = true
-            let delegate = PhotoCaptureDelegate { [weak self] result in
-                self?.onCapture?(result)
-            } onError: { [weak self] error in
-                self?.onError?(error)
-            }
-            // Retain delegate via associated object
-            objc_setAssociatedObject(heifSettings, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
-            photoOutput.capturePhoto(with: heifSettings, delegate: delegate)
         } else {
-            settings.isHighResolutionPhotoEnabled = true
-            let delegate = PhotoCaptureDelegate { [weak self] result in
+            captureSettings = settings
+        }
+
+        // Request the highest resolution the output supports
+        captureSettings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+
+        let delegate = PhotoCaptureDelegate { [weak self] result in
+            DispatchQueue.main.async {
                 self?.onCapture?(result)
-            } onError: { [weak self] error in
+            }
+        } onError: { [weak self] error in
+            DispatchQueue.main.async {
                 self?.onError?(error)
             }
-            objc_setAssociatedObject(settings, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
-            photoOutput.capturePhoto(with: settings, delegate: delegate)
         }
+        objc_setAssociatedObject(captureSettings, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
+        photoOutput.capturePhoto(with: captureSettings, delegate: delegate)
     }
 
     // MARK: - Video Recording
@@ -194,11 +198,15 @@ final class CameraPreviewController: UIViewController {
             .appendingPathExtension("mov")
 
         let delegate = MovieRecordingDelegate { [weak self] url in
-            self?.isRecording = false
-            self?.onCapture?(.video(url))
+            DispatchQueue.main.async {
+                self?.isRecording = false
+                self?.onCapture?(.video(url))
+            }
         } onError: { [weak self] error in
-            self?.isRecording = false
-            self?.onError?(error)
+            DispatchQueue.main.async {
+                self?.isRecording = false
+                self?.onError?(error)
+            }
         }
 
         // Retain delegate
@@ -235,12 +243,14 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
         didFinishProcessingPhoto photo: AVCapturePhoto,
         error: Error?
     ) {
+        print("[Camera] Photo delegate fired, error: \(error?.localizedDescription ?? "none")")
         if let error {
             onError("Photo capture failed: \(error.localizedDescription)")
             return
         }
 
         guard let data = photo.fileDataRepresentation() else {
+            print("[Camera] Failed to get photo data representation")
             onError("Failed to get photo data")
             return
         }
@@ -249,6 +259,7 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
         let isHEIF = photo.resolvedSettings.photoProcessingTimeRange.duration != .zero
             || String(describing: type(of: photo)).contains("HEIF")
 
+        print("[Camera] Photo captured: \(data.count) bytes, isHEIF: \(isHEIF)")
         onResult(.photo(data, isHEIF: isHEIF))
     }
 }

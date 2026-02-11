@@ -138,10 +138,10 @@ final class FeedDataService {
             InsertAction.self,
             schema: "public",
             table: "content",
-            filter: "cell_id=eq.\(cellId)"
+            filter: .eq("cell_id", value: cellId)
         )
 
-        await channel.subscribe()
+        try? await channel.subscribeWithError()
 
         // Listen for new content
         Task {
@@ -163,16 +163,13 @@ final class FeedDataService {
     }
 
     private func handleNewContent(_ action: InsertAction) async {
-        // Decode the new content item and add to feed if it has a signed URL
-        // The Realtime payload contains the raw row data
-        guard let record = action.record as? [String: Any],
-              let contentId = record["id"] as? String else { return }
+        // The Realtime payload contains the raw row data but not the joined
+        // query result (username, distance, signed URL). Rather than trying
+        // to reconstruct a partial ContentItem, signal the feed to refresh
+        // so it can re-fetch via the full get_nearby_content RPC.
+        guard action.record["id"] != nil else { return }
 
-        // Re-fetch the full item via RPC to get username and distance
-        // (Realtime only gives us the raw row, not the joined query result)
-        // For now, trigger a refresh notification
         await MainActor.run {
-            // Signal that new content is available
             NotificationCenter.default.post(name: .newNearbyContentAvailable, object: nil)
         }
     }

@@ -10,7 +10,6 @@ import SwiftUI
 
 struct MainShell: View {
     @Environment(AppState.self) private var appState
-    @Environment(APIGuard.self) private var apiGuard
 
     var body: some View {
         @Bindable var state = appState
@@ -48,21 +47,6 @@ struct MainShell: View {
                     AnalyticsService.shared.track(.settingsOpened)
                 }
         }
-        // Global CAPTCHA escalation overlay
-        .overlay {
-            if apiGuard.needsCaptcha {
-                CaptchaChallengeView(
-                    onToken: { token in
-                        apiGuard.resolveCaptcha(token: token)
-                    },
-                    onDismiss: {
-                        apiGuard.resolveCaptcha(token: nil)
-                    }
-                )
-                .transition(.opacity)
-            }
-        }
-        .animation(.linear(duration: 0.2), value: apiGuard.needsCaptcha)
         // Deep link dialog
         .overlay {
             if appState.showDeepLinkDialog, let result = appState.deepLinkResult {

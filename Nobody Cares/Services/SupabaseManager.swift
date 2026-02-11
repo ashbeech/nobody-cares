@@ -21,7 +21,8 @@ let supabase = SupabaseClient(
     supabaseKey: Secrets.supabasePublishableKey,
     options: .init(
         auth: .init(
-            storage: SupabaseKeychainStorage()
+            storage: SupabaseKeychainStorage(),
+            emitLocalSessionAsInitialSession: true
         )
     )
 )

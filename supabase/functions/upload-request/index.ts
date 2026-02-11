@@ -7,6 +7,14 @@
  * The client uploads directly to Storage using the signed URL,
  * then calls upload-confirm to activate the content.
  *
+ * Security layers (in order):
+ *   1. JWT authentication
+ *   2. Ban check
+ *   3. Device assertion verification  (v2 security)
+ *   4. IP-level rate limit             (v2 security)
+ *   5. Per-user rate limit
+ *   6. Field validation
+ *
  * Deploy with: supabase functions deploy upload-request --no-verify-jwt
  *
  * Environment variables (auto-provided):
@@ -16,6 +24,8 @@
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { verifyAssertion } from "../_shared/verify-assertion.ts";
+import { getClientIP, checkIPRateLimit } from "../_shared/ip-utils.ts";
 
 interface UploadRequest {
   content_type: "image" | "video";
@@ -39,7 +49,7 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
-    // Authenticate
+    // ── 1. Authenticate ─────────────────────────────────────────
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
       return jsonResponse({ error: "Missing authorization" }, 401);
@@ -55,13 +65,30 @@ serve(async (req) => {
       return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
-    // Check if user is banned
+    // ── 2. Ban check ────────────────────────────────────────────
     const { data: banCheck } = await supabase.rpc("check_banned");
     if (banCheck === true) {
       return jsonResponse({ error: "Access revoked" }, 403);
     }
 
-    // Check rate limit
+    // ── 3. Device assertion ─────────────────────────────────────
+    const assertionResult = await verifyAssertion(supabase, req, user.id);
+    if (!assertionResult.valid) {
+      return jsonResponse(
+        { error: "Assertion failed", detail: assertionResult.error, code: "assertion_failed" },
+        403
+      );
+    }
+
+    // ── 4. IP-level rate limit ──────────────────────────────────
+    const clientIP = getClientIP(req);
+    const ipResult = await checkIPRateLimit(supabase, clientIP, "ip_upload");
+    if (ipResult === "hard_exceeded") {
+      return jsonResponse({ error: "Rate limit exceeded", code: "rate_limited" }, 429);
+    }
+    // soft_exceeded at IP level → proceed but flag for monitoring
+
+    // ── 5. Per-user rate limit (upload_request — burst) ─────────
     const { data: rateLimitResult } = await supabase.rpc("check_rate_limit", {
       p_user_id: user.id,
       p_action: "upload_request",
@@ -76,14 +103,11 @@ serve(async (req) => {
       return jsonResponse({ error: "Rate limit exceeded", code: "rate_limited" }, 429);
     }
 
-    if (rateLimitResult === "soft_exceeded") {
-      return jsonResponse({ error: "Captcha required", code: "captcha_required" }, 429);
-    }
+    // soft_exceeded: proceed — attestation is the real gate, not CAPTCHA
 
-    // Parse request body
+    // ── 6. Parse & validate request body ────────────────────────
     const body: UploadRequest = await req.json();
 
-    // Validate fields
     if (!body.content_type || !body.file_extension || !body.capture_lat || !body.capture_lng) {
       return jsonResponse({ error: "Missing required fields" }, 400);
     }
@@ -100,7 +124,17 @@ serve(async (req) => {
       return jsonResponse({ error: "GPS accuracy insufficient" }, 400);
     }
 
-    // Check content creation rate limit
+    // Whitelist allowed extensions
+    const allowedExtensions: Record<string, string[]> = {
+      image: ["heic", "heif", "jpg", "jpeg"],
+      video: ["mov", "mp4"],
+    };
+    const ext = body.file_extension.toLowerCase().replace(/^\./, "");
+    if (!allowedExtensions[body.content_type]?.includes(ext)) {
+      return jsonResponse({ error: "File extension not allowed for this content type" }, 400);
+    }
+
+    // ── 7. Per-user rate limit (content creation — daily/hourly) ─
     const actionType = body.content_type === "video" ? "video_create" : "content_create";
     const { data: contentRateResult } = await supabase.rpc("check_rate_limit", {
       p_user_id: user.id,
@@ -111,17 +145,14 @@ serve(async (req) => {
       return jsonResponse({ error: "Content creation rate limit exceeded", code: "rate_limited" }, 429);
     }
 
-    if (contentRateResult === "soft_exceeded") {
-      return jsonResponse({ error: "Captcha required", code: "captcha_required" }, 429);
-    }
+    // soft_exceeded: proceed — attestation is the real gate, not CAPTCHA
 
-    // Generate content ID and storage path
+    // ── 8. Create content record (inactive until confirmed) ─────
     const contentId = crypto.randomUUID();
     const now = new Date();
     const datePath = `${now.getUTCFullYear()}/${String(now.getUTCMonth() + 1).padStart(2, "0")}/${String(now.getUTCDate()).padStart(2, "0")}`;
-    const storagePath = `originals/${datePath}/${contentId}.${body.file_extension}`;
+    const storagePath = `originals/${datePath}/${contentId}.${ext}`;
 
-    // Create content record (inactive until confirmed)
     const { error: insertError } = await supabase.from("content").insert({
       id: contentId,
       user_id: user.id,
@@ -142,7 +173,7 @@ serve(async (req) => {
       return jsonResponse({ error: "Failed to create content record" }, 500);
     }
 
-    // Generate signed upload URL (expires in 10 minutes)
+    // ── 9. Generate signed upload URL (10 min TTL) ──────────────
     const { data: signedUrl, error: signError } = await supabase.storage
       .from("content")
       .createSignedUploadUrl(storagePath);

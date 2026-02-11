@@ -41,7 +41,7 @@ struct BottomTabBar: View {
 
                 tabButton(
                     tab: .create,
-                    icon: .cameraPlus,
+                    icon: .camera,
                     label: "MAKE"
                 )
             }

@@ -20,6 +20,7 @@ enum NCColor {
     static let accentPink   = Color(hex: 0xFF1493)          // #FF1493
     static let accentTeal   = Color(hex: 0x008080)          // #008080
     static let error        = Color.red                     // #FF0000
+    static let shadow       = Color(hex: 0xDCDCDC)          // #DCDCDC — subtle shadow for light backgrounds
 }
 
 // MARK: - Typography
@@ -96,7 +97,7 @@ enum NCMetrics {
 
 /// Adds a hard pixel shadow (no blur)
 struct HardShadow: ViewModifier {
-    var color: Color = .black
+    var color: Color = NCColor.shadow
     var x: CGFloat = 2
     var y: CGFloat = 2
 
@@ -122,7 +123,7 @@ struct RetroBorder: ViewModifier {
 
 extension View {
     func hardShadow(
-        color: Color = .black,
+        color: Color = NCColor.shadow,
         x: CGFloat = NCMetrics.shadowOffset,
         y: CGFloat = NCMetrics.shadowOffset
     ) -> some View {

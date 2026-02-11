@@ -13,13 +13,13 @@ struct EmptyFeedView: View {
 
     var body: some View {
         ZStack {
-            // Background dither
+            // Background dither — animated subtle scroll
             DitherPatternView(
                 style: .light,
                 foreground: NCColor.dither,
-                background: NCColor.background
+                background: NCColor.background,
+                animated: true
             )
-            .ignoresSafeArea()
 
             // Alert dialog
             RetroWindow(title: "ALERT", icon: .caution) {

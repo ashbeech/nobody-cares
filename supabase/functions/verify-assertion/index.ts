@@ -131,17 +131,13 @@ serve(async (req) => {
       keyId: keyId,
     };
 
-    // If rate limited, include that in the response
-    if (rateLimitResult === "soft_exceeded") {
-      responsePayload.captcha_required = true;
-    } else if (rateLimitResult === "hard_exceeded") {
-      // Decrease trust score
+    // If hard rate limited, decrease trust score and flag
+    if (rateLimitResult === "hard_exceeded") {
       await supabase.rpc("decrease_trust_score", {
         p_user_id: user.id,
         p_amount: 5,
         p_reason: "rate_limit_hard_exceeded",
       });
-      responsePayload.captcha_required = true;
       responsePayload.rate_limited = true;
     }
 
