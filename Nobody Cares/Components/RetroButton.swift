@@ -74,7 +74,10 @@ struct RetroButtonStyle: ButtonStyle {
 
     private var shadowColor: Color {
         guard isEnabled else { return .clear }
-        return NCColor.shadow
+        switch variant {
+        case .primary:   return Color(hex: 0x1A1A1A)   // Near-black — matches dark fill
+        case .secondary: return Color(hex: 0x444444)    // Dark gray — heavy retro shadow
+        }
     }
 
     private var shadowX: CGFloat {

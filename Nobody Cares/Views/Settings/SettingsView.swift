@@ -91,14 +91,8 @@ struct SettingsView: View {
                 .background(NCColor.background)
 
             HStack {
-                Button(action: { dismiss() }) {
-                    Rectangle()
-                        .stroke(NCColor.ink, lineWidth: 1.5)
-                        .frame(width: NCMetrics.closeBoxSize, height: NCMetrics.closeBoxSize)
-                        .background(NCColor.background)
-                }
-                .buttonStyle(.plain)
-                .padding(.leading, 12)
+                RetroCloseBox { dismiss() }
+                    .padding(.leading, 12)
                 Spacer()
             }
         }
