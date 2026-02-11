@@ -1,0 +1,205 @@
+//
+//  FeedDataService.swift
+//  Nobody Cares
+//
+//  Fetches nearby content via get_nearby_content() RPC,
+//  generates short-lived signed URLs for media,
+//  and manages Realtime subscriptions for new nearby content.
+//
+
+import Foundation
+import Supabase
+import Realtime
+
+// MARK: - Feed Data Service
+
+@Observable
+final class FeedDataService {
+
+    var items: [ContentItem] = []
+    var isLoading = false
+    var error: String?
+
+    private var realtimeChannel: RealtimeChannelV2?
+    private var currentCellId: String?
+    private let pageSize = 20
+
+    // MARK: - Fetch Nearby Content
+
+    /// Fetch content near the given coordinates via Postgres RPC.
+    func fetchNearbyContent(
+        latitude: Double,
+        longitude: Double,
+        radius: Double = 10.0,
+        offset: Int = 0
+    ) async throws -> [ContentItem] {
+        isLoading = true
+        defer { isLoading = false }
+
+        let userId = try? await supabase.auth.session.user.id
+
+        let params = NearbyContentParams(
+            viewerLat: latitude,
+            viewerLng: longitude,
+            radiusMeters: radius,
+            viewerUserId: userId?.uuidString,
+            pageSize: pageSize,
+            pageOffset: offset
+        )
+
+        var fetchedItems: [ContentItem] = try await supabase
+            .rpc("get_nearby_content", params: params)
+            .execute()
+            .value
+
+        // Generate signed URLs for each item
+        fetchedItems = await generateSignedURLs(for: fetchedItems)
+
+        return fetchedItems
+    }
+
+    /// Refresh the feed from scratch
+    func refresh(latitude: Double, longitude: Double, radius: Double = 10.0) async {
+        do {
+            let newItems = try await fetchNearbyContent(
+                latitude: latitude,
+                longitude: longitude,
+                radius: radius
+            )
+            items = newItems
+            error = nil
+        } catch {
+            self.error = "Failed to load nearby content"
+        }
+    }
+
+    /// Load the next page of content
+    func loadMore(latitude: Double, longitude: Double, radius: Double = 10.0) async {
+        do {
+            let moreItems = try await fetchNearbyContent(
+                latitude: latitude,
+                longitude: longitude,
+                radius: radius,
+                offset: items.count
+            )
+            items.append(contentsOf: moreItems)
+        } catch {
+            // Silent failure for pagination
+        }
+    }
+
+    // MARK: - Signed URL Generation
+
+    /// Generate short-lived (1 hour) signed URLs for content items.
+    private func generateSignedURLs(for items: [ContentItem]) async -> [ContentItem] {
+        var updatedItems = items
+
+        // Batch generate signed URLs
+        let paths = items.map(\.mediaPath)
+
+        do {
+            let signedURLs = try await supabase.storage
+                .from("content")
+                .createSignedURLs(paths: paths, expiresIn: 3600) // 1 hour
+
+            for (index, signedURL) in signedURLs.enumerated() where index < updatedItems.count {
+                updatedItems[index].signedURL = signedURL
+            }
+        } catch {
+            // If batch fails, try individual URLs as fallback
+            for index in updatedItems.indices {
+                do {
+                    let url = try await supabase.storage
+                        .from("content")
+                        .createSignedURL(path: updatedItems[index].mediaPath, expiresIn: 3600)
+                    updatedItems[index].signedURL = url
+                } catch {
+                    // Skip items where URL generation fails
+                }
+            }
+        }
+
+        return updatedItems
+    }
+
+    // MARK: - Realtime Subscription
+
+    /// Subscribe to new content in the given S2 cell (for stationary mode).
+    /// When the user isn't moving, we listen for server-pushed updates instead of polling.
+    func subscribeToCell(cellId: String) async {
+        // Unsubscribe from previous cell
+        await unsubscribeFromCell()
+
+        currentCellId = cellId
+
+        let channel = supabase.realtimeV2.channel("content-\(cellId)")
+
+        let insertions = channel.postgresChange(
+            InsertAction.self,
+            schema: "public",
+            table: "content",
+            filter: "cell_id=eq.\(cellId)"
+        )
+
+        await channel.subscribe()
+
+        // Listen for new content
+        Task {
+            for await insertion in insertions {
+                await handleNewContent(insertion)
+            }
+        }
+
+        realtimeChannel = channel
+    }
+
+    /// Unsubscribe from Realtime updates
+    func unsubscribeFromCell() async {
+        if let channel = realtimeChannel {
+            await channel.unsubscribe()
+            realtimeChannel = nil
+        }
+        currentCellId = nil
+    }
+
+    private func handleNewContent(_ action: InsertAction) async {
+        // Decode the new content item and add to feed if it has a signed URL
+        // The Realtime payload contains the raw row data
+        guard let record = action.record as? [String: Any],
+              let contentId = record["id"] as? String else { return }
+
+        // Re-fetch the full item via RPC to get username and distance
+        // (Realtime only gives us the raw row, not the joined query result)
+        // For now, trigger a refresh notification
+        await MainActor.run {
+            // Signal that new content is available
+            NotificationCenter.default.post(name: .newNearbyContentAvailable, object: nil)
+        }
+    }
+}
+
+// MARK: - RPC Parameter Types
+
+private struct NearbyContentParams: Encodable {
+    let viewerLat: Double
+    let viewerLng: Double
+    let radiusMeters: Double
+    let viewerUserId: String?
+    let pageSize: Int
+    let pageOffset: Int
+
+    enum CodingKeys: String, CodingKey {
+        case viewerLat = "viewer_lat"
+        case viewerLng = "viewer_lng"
+        case radiusMeters = "radius_meters"
+        case viewerUserId = "viewer_user_id"
+        case pageSize = "page_size"
+        case pageOffset = "page_offset"
+    }
+}
+
+// MARK: - Notification Names
+
+extension Notification.Name {
+    static let newNearbyContentAvailable = Notification.Name("newNearbyContentAvailable")
+}
