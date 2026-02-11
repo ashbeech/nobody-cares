@@ -10,7 +10,8 @@ import SwiftUI
 
 enum PixelIconType: String {
     case eye            // Feed tab
-    case cameraPlus     // Create tab
+    case camera         // Create tab (simple camera)
+    case cameraPlus     // Create tab (camera with +)
     case gear           // Settings
     case flag           // Report
     case trash          // Delete
@@ -27,6 +28,7 @@ enum PixelIconType: String {
     var symbolName: String {
         switch self {
         case .eye:           return "eye"
+        case .camera:        return "camera"
         case .cameraPlus:    return "camera.badge.plus"
         case .gear:          return "gearshape"
         case .flag:          return "flag"
@@ -60,6 +62,7 @@ struct PixelIcon: View {
     private var filledSymbolName: String {
         switch type {
         case .eye:          return "eye.fill"
+        case .camera:       return "camera.fill"
         case .cameraPlus:   return "camera.fill.badge.plus"
         case .gear:         return "gearshape.fill"
         case .flag:         return "flag.fill"

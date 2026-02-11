@@ -44,7 +44,7 @@ serve(async (req) => {
 
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
     );
 
     // ── 1. Authenticate ─────────────────────────────────────────
@@ -67,8 +67,12 @@ serve(async (req) => {
     const assertionResult = await verifyAssertion(supabase, req, user.id);
     if (!assertionResult.valid) {
       return jsonResponse(
-        { error: "Assertion failed", detail: assertionResult.error, code: "assertion_failed" },
-        403
+        {
+          error: "Assertion failed",
+          detail: assertionResult.error,
+          code: "assertion_failed",
+        },
+        403,
       );
     }
 
@@ -81,7 +85,9 @@ serve(async (req) => {
 
     const { data: content, error: fetchError } = await supabase
       .from("content")
-      .select("id, user_id, original_path, is_deleted, content_type, file_size_bytes")
+      .select(
+        "id, user_id, original_path, is_deleted, content_type, file_size_bytes",
+      )
       .eq("id", body.content_id)
       .single();
 
@@ -121,12 +127,28 @@ serve(async (req) => {
     const actualSize: number | undefined = file.metadata?.size;
     if (typeof actualSize === "number") {
       if (actualSize <= 0) {
-        await rejectUpload(supabase, body.content_id, body.storage_path, "Empty file");
-        return jsonResponse({ error: "Uploaded file is empty", code: "validation_failed" }, 400);
+        await rejectUpload(
+          supabase,
+          body.content_id,
+          body.storage_path,
+          "Empty file",
+        );
+        return jsonResponse(
+          { error: "Uploaded file is empty", code: "validation_failed" },
+          400,
+        );
       }
       if (actualSize > MAX_FILE_SIZE) {
-        await rejectUpload(supabase, body.content_id, body.storage_path, "Exceeds 50MB");
-        return jsonResponse({ error: "File exceeds maximum size", code: "validation_failed" }, 400);
+        await rejectUpload(
+          supabase,
+          body.content_id,
+          body.storage_path,
+          "Exceeds 50MB",
+        );
+        return jsonResponse(
+          { error: "File exceeds maximum size", code: "validation_failed" },
+          400,
+        );
       }
     }
 
@@ -135,9 +157,16 @@ serve(async (req) => {
     if (actualMime) {
       const allowed = ALLOWED_MIME_TYPES[content.content_type] ?? [];
       if (!allowed.includes(actualMime.toLowerCase())) {
-        await rejectUpload(supabase, body.content_id, body.storage_path,
-          `MIME ${actualMime} not allowed for ${content.content_type}`);
-        return jsonResponse({ error: "Invalid file type", code: "validation_failed" }, 400);
+        await rejectUpload(
+          supabase,
+          body.content_id,
+          body.storage_path,
+          `MIME ${actualMime} not allowed for ${content.content_type}`,
+        );
+        return jsonResponse(
+          { error: "Invalid file type", code: "validation_failed" },
+          400,
+        );
       }
 
       // 5c. Cross-check: declared type (image/video) must match actual MIME prefix
@@ -147,9 +176,16 @@ serve(async (req) => {
         (content.content_type === "image" && !isImage) ||
         (content.content_type === "video" && !isVideo)
       ) {
-        await rejectUpload(supabase, body.content_id, body.storage_path,
-          `Declared ${content.content_type} but uploaded ${actualMime}`);
-        return jsonResponse({ error: "Content type mismatch", code: "validation_failed" }, 400);
+        await rejectUpload(
+          supabase,
+          body.content_id,
+          body.storage_path,
+          `Declared ${content.content_type} but uploaded ${actualMime}`,
+        );
+        return jsonResponse(
+          { error: "Content type mismatch", code: "validation_failed" },
+          400,
+        );
       }
     }
 
@@ -202,7 +238,7 @@ async function rejectUpload(
   supabase: ReturnType<typeof createClient>,
   contentId: string,
   storagePath: string,
-  reason: string
+  reason: string,
 ) {
   console.warn(`[upload-confirm] Rejecting upload ${contentId}: ${reason}`);
 

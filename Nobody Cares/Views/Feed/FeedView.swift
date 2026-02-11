@@ -27,6 +27,10 @@ struct FeedView: View {
 
     var body: some View {
         ZStack {
+            // Dynamic background — extends edge to edge
+            feedBackground
+                .ignoresSafeArea()
+
             Group {
                 switch viewModel.feedState {
                 case .loading:
@@ -68,7 +72,6 @@ struct FeedView: View {
                 blockedBanner
             }
         }
-        .background(Color.black)
         .animation(.linear(duration: 0.2), value: showReport)
         .onAppear {
             viewModel.startFeed()
@@ -99,6 +102,18 @@ struct FeedView: View {
                     blockItem = nil
                 }
             )
+        }
+    }
+
+    // MARK: - Dynamic Background
+
+    @ViewBuilder
+    private var feedBackground: some View {
+        switch viewModel.feedState {
+        case .content:
+            Color.black
+        case .empty, .endOfFeed, .error, .loading:
+            NCColor.background
         }
     }
 
