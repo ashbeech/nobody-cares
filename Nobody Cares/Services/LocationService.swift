@@ -78,11 +78,13 @@ final class LocationService {
     // MARK: - Start / Stop
 
     func startMonitoring() {
+        FeedDebugLogger.log(.loc, "startMonitoring")
         locationManager.startUpdatingLocation()
         startPeriodicQueryTimer()
     }
 
     func stopMonitoring() {
+        FeedDebugLogger.log(.loc, "stopMonitoring")
         locationManager.stopUpdatingLocation()
         stationaryTimer?.invalidate()
         stationaryTimer = nil
@@ -108,10 +110,14 @@ final class LocationService {
         if let previous = previousLocation {
             let distance = location.distance(from: previous)
             if distance >= movementThreshold {
+                FeedDebugLogger.log(.loc, "📍 movement detected: \(String(format: "%.1f", distance))m",
+                                    detail: "lat=\(String(format: "%.6f", location.coordinate.latitude)) lng=\(String(format: "%.6f", location.coordinate.longitude)) acc=\(String(format: "%.1f", location.horizontalAccuracy))m")
                 handleMovement(from: previous, to: location)
             }
         } else {
             // First location fix
+            FeedDebugLogger.log(.loc, "📍 FIRST location fix",
+                                detail: "lat=\(String(format: "%.6f", location.coordinate.latitude)) lng=\(String(format: "%.6f", location.coordinate.longitude)) acc=\(String(format: "%.1f", location.horizontalAccuracy))m")
             lastQueryLocation = location
             movementState = .unknown
             onSignificantMovement?()
@@ -134,16 +140,21 @@ final class LocationService {
         if let lastQuery = lastQueryLocation {
             let distanceFromLastQuery = current.distance(from: lastQuery)
             if distanceFromLastQuery >= movementThreshold {
+                FeedDebugLogger.log(.loc, "significantMovement — \(String(format: "%.1f", distanceFromLastQuery))m from last query → re-querying")
                 lastQueryLocation = current
                 onSignificantMovement?()
+            } else {
+                FeedDebugLogger.log(.loc, "movement — \(String(format: "%.1f", distanceFromLastQuery))m from last query (below threshold)")
             }
         } else {
+            FeedDebugLogger.log(.loc, "significantMovement — first query location set")
             lastQueryLocation = current
             onSignificantMovement?()
         }
     }
 
     private func handleBecameStationary() {
+        FeedDebugLogger.log(.loc, "🧍 becameStationary — no movement for \(stationaryDelay)s")
         movementState = .stationary
         onBecameStationary?()
     }
@@ -155,6 +166,7 @@ final class LocationService {
             Task { @MainActor in
                 guard let self else { return }
                 if self.movementState == .moving {
+                    FeedDebugLogger.log(.loc, "⏱ periodicQuery — \(self.queryInterval)s timer fired (state=moving)")
                     self.onSignificantMovement?()
                 }
             }

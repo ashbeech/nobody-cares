@@ -158,9 +158,13 @@ final class FeedPagerViewController: UIViewController {
     func updateItems(_ newItems: [ContentItem]) {
         let oldCount = items.count
         items = newItems
+        FeedDebugLogger.log(.pager, "updateItems — \(oldCount)→\(newItems.count) items")
 
         // collectionView is set up in viewDidLoad — may not exist yet
-        guard collectionView != nil else { return }
+        guard collectionView != nil else {
+            FeedDebugLogger.log(.pager, "updateItems — collectionView not yet loaded, deferring")
+            return
+        }
         collectionView.reloadData()
 
         // Clamp current index
@@ -172,6 +176,7 @@ final class FeedPagerViewController: UIViewController {
 
         // If we just went from 0→N items, scroll to index 0 and start playback
         if oldCount == 0 && !items.isEmpty {
+            FeedDebugLogger.log(.pager, "updateItems — 0→\(newItems.count): scrolling to index 0, activating playback")
             collectionView.contentOffset = .zero
             mediaPreloader?.updateBuffer(around: 0)
             mediaPreloader?.activatePlayback(at: 0, isMuted: isMuted, isPaused: isPaused)
@@ -180,11 +185,18 @@ final class FeedPagerViewController: UIViewController {
 
     /// Programmatic scroll (auto-advance or ViewModel-driven).
     func scrollToIndex(_ index: Int, animated: Bool) {
-        guard !collectionView.isDragging, !collectionView.isDecelerating else { return }
-        guard index >= 0, index < items.count else { return }
+        guard !collectionView.isDragging, !collectionView.isDecelerating else {
+            FeedDebugLogger.log(.pager, "scrollToIndex(\(index)) — BLOCKED (scroll busy)")
+            return
+        }
+        guard index >= 0, index < items.count else {
+            FeedDebugLogger.log(.pager, "scrollToIndex(\(index)) — BLOCKED (out of range, count=\(items.count))")
+            return
+        }
         let H = collectionView.bounds.height
         guard H > 0 else { return }
 
+        FeedDebugLogger.log(.pager, "scrollToIndex(\(index), animated=\(animated)) — programmatic scroll")
         isProgrammaticScroll = true
         collectionView.setContentOffset(CGPoint(x: 0, y: CGFloat(index) * H), animated: animated)
 
@@ -218,6 +230,7 @@ final class FeedPagerViewController: UIViewController {
     // MARK: - Actions
 
     @objc private func handleRefresh() {
+        FeedDebugLogger.log(.pager, "handleRefresh — pull-to-refresh triggered")
         onRefresh?()
     }
 
@@ -225,11 +238,13 @@ final class FeedPagerViewController: UIViewController {
         switch gesture.state {
         case .began:
             if !isPauseActive {
+                FeedDebugLogger.log(.pager, "long-press BEGAN — pausing")
                 isPauseActive = true
                 onPauseChanged?(true)
             }
         case .ended, .cancelled, .failed:
             if isPauseActive {
+                FeedDebugLogger.log(.pager, "long-press ENDED — resuming")
                 isPauseActive = false
                 onPauseChanged?(false)
             }
@@ -248,6 +263,11 @@ final class FeedPagerViewController: UIViewController {
         let clamped = max(0, min(raw, items.count - 1))
 
         let pageDidChange = (clamped != currentIndex)
+        if pageDidChange {
+            FeedDebugLogger.log(.pager, "handlePageCommit — page changed \(currentIndex)→\(clamped)")
+        } else {
+            FeedDebugLogger.log(.pager, "handlePageCommit — settled on same page \(clamped)")
+        }
         currentIndex = clamped
 
         // Always report the VC's actual settled index.
@@ -271,12 +291,14 @@ final class FeedPagerViewController: UIViewController {
 
     private func handleReadinessChanged(index: Int, ready: Bool) {
         guard ready else { return }
+        FeedDebugLogger.log(.pager, "readinessChanged — index \(index) now READY (current=\(currentIndex))")
         let indexPath = IndexPath(item: index, section: 0)
         if let cell = collectionView.cellForItem(at: indexPath) as? FeedContentCell {
             configureCell(cell, at: index)
 
             // If this is the current cell and it's a video, start playback
             if index == currentIndex {
+                FeedDebugLogger.log(.pager, "readinessChanged — hot-swapping playback for current index \(index)")
                 mediaPreloader?.activatePlayback(at: index, isMuted: isMuted, isPaused: isPaused)
             }
         }
@@ -377,6 +399,7 @@ extension FeedPagerViewController {
         let H = collectionView.bounds.height
         guard H > 0 else { return }
         dragStartIndex = Int(round(scrollView.contentOffset.y / H))
+        FeedDebugLogger.log(.pager, "👆 scrollViewWillBeginDragging — dragStartIndex=\(dragStartIndex)")
         onDragBegan?()
     }
 
@@ -389,10 +412,14 @@ extension FeedPagerViewController {
         guard H > 0, !items.isEmpty else { return }
 
         // Don't interfere with an active refresh control
-        if refreshControl.isRefreshing { return }
+        if refreshControl.isRefreshing {
+            FeedDebugLogger.log(.pager, "scrollViewWillEndDragging — refresh active, not snapping")
+            return
+        }
 
         // Overscroll above top → snap to page 0
         if scrollView.contentOffset.y < 0 {
+            FeedDebugLogger.log(.pager, "scrollViewWillEndDragging — overscroll above top, snap to 0")
             targetContentOffset.pointee.y = 0
             return
         }
@@ -419,6 +446,9 @@ extension FeedPagerViewController {
         // Clamp to valid range
         targetIndex = max(0, min(targetIndex, lastIndex))
 
+        FeedDebugLogger.log(.pager, "👆 SNAP DECISION — dragStart=\(dragStartIndex) target=\(targetIndex)",
+                            detail: "dragDist=\(String(format: "%.2f", dragDistance)) vel=\(String(format: "%.2f", vPagesPerSec)) distThresh=\(distThreshold) velThresh=\(velocityThreshold)")
+
         // No readiness gate on user swipes — swiping must always work.
         // If the destination isn't fully preloaded yet the cell will show
         // a poster frame or placeholder and hot-swap once ready.
@@ -427,16 +457,19 @@ extension FeedPagerViewController {
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        FeedDebugLogger.log(.pager, "scrollViewDidEndDragging — willDecelerate=\(decelerate)")
         if !decelerate {
             handlePageCommit()
         }
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        FeedDebugLogger.log(.pager, "scrollViewDidEndDecelerating")
         handlePageCommit()
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        FeedDebugLogger.log(.pager, "scrollViewDidEndScrollingAnimation (programmatic)")
         isProgrammaticScroll = false
         handlePageCommit()
     }

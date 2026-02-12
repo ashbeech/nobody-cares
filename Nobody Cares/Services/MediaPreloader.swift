@@ -61,14 +61,17 @@ final class MediaPreloader {
         let oldItems = items
         items = newItems
 
+        var releasedCount = 0
         let maxCount = max(oldItems.count, newItems.count)
         for i in 0..<maxCount {
             let oldId = i < oldItems.count ? oldItems[i].id : nil
             let newId = i < newItems.count ? newItems[i].id : nil
             if oldId != newId {
                 release(index: i)
+                releasedCount += 1
             }
         }
+        FeedDebugLogger.log(.media, "setItems — \(oldItems.count)→\(newItems.count) items, released \(releasedCount) changed indices")
     }
 
     // MARK: - Public: Buffer Management
@@ -88,9 +91,14 @@ final class MediaPreloader {
             Array(preparationTasks.keys) +
             Array(readiness.keys)
         )
+        var releasedOutside = 0
         for idx in allKnown where !needed.contains(idx) {
             release(index: idx)
+            releasedOutside += 1
         }
+
+        let readyInWindow = needed.filter { readiness[$0] == true }.count
+        FeedDebugLogger.log(.media, "updateBuffer(around: \(currentIndex)) — window=[\(lo)…\(hi)], ready=\(readyInWindow)/\(needed.count), released=\(releasedOutside) outside")
 
         // Prepare inside the window (current first, then immediate neighbors, then ±2)
         prepare(index: currentIndex)
@@ -115,8 +123,13 @@ final class MediaPreloader {
             let player = pool[slot]
             player.isMuted = isMuted
             if !isPaused {
+                FeedDebugLogger.log(.media, "▶ activatePlayback — index \(index) slot \(slot) (muted=\(isMuted))")
                 player.play()
+            } else {
+                FeedDebugLogger.log(.media, "⏸ activatePlayback — index \(index) slot \(slot) PAUSED")
             }
+        } else {
+            FeedDebugLogger.log(.media, "activatePlayback — index \(index) has no slot assigned (not ready?)")
         }
     }
 
@@ -146,6 +159,7 @@ final class MediaPreloader {
         guard readiness[index] != true, preparationTasks[index] == nil else { return }
 
         let item = items[index]
+        FeedDebugLogger.log(.media, "prepare(\(index)) — \(item.contentType.rawValue) id=\(item.id.uuidString.prefix(8))…")
 
         preparationTasks[index] = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled else { return }
@@ -166,6 +180,7 @@ final class MediaPreloader {
     }
 
     func cancelAll() {
+        FeedDebugLogger.log(.media, "cancelAll — releasing \(slotAssignments.count) slots, \(preparationTasks.count) tasks")
         for idx in Array(slotAssignments.keys) { release(index: idx) }
         for (idx, task) in preparationTasks {
             task.cancel()
@@ -320,6 +335,8 @@ final class MediaPreloader {
 
     @MainActor
     private func markReady(_ index: Int) {
+        let type = index < items.count ? items[index].contentType.rawValue : "?"
+        FeedDebugLogger.log(.media, "✅ markReady(\(index)) — \(type)")
         readiness[index] = true
         onReadinessChanged?(index, true)
     }
