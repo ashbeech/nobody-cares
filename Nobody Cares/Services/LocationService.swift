@@ -35,13 +35,24 @@ final class LocationService {
     var isSimulatedLocation = false
     var isLowAccuracy = false
 
-    /// Effective search radius — widened when accuracy is poor
+    /// Effective search radius — accounts for GPS uncertainty on *both* sides.
+    ///
+    /// Two independent GPS readings are involved in a proximity check:
+    ///   1. The content's capture position (recorded at creation time)
+    ///   2. The viewer's current position (read at query time)
+    ///
+    /// Each can be off by its `horizontalAccuracy`. With typical 7-10m accuracy,
+    /// two readings can compound to 15-20m of drift — easily pushing content
+    /// outside a 10m radius even though the user hasn't moved.
+    ///
+    /// Formula: baseRadius + 2 × viewerAccuracy  (conservative estimate that
+    /// captures both sides, since we don't have the capture accuracy at query time).
+    /// Floor of 30m ensures stability even with excellent GPS.
     var effectiveRadius: Double {
-        guard let location = currentLocation else { return 10.0 }
-        if location.horizontalAccuracy > 50 {
-            return max(10.0, location.horizontalAccuracy * 1.5)
-        }
-        return 10.0
+        let baseRadius: Double = 10.0
+        let minimumRadius: Double = 30.0
+        guard let location = currentLocation else { return minimumRadius }
+        return max(minimumRadius, baseRadius + location.horizontalAccuracy * 2)
     }
 
     // MARK: - Callbacks
@@ -58,7 +69,7 @@ final class LocationService {
     private var stationaryTimer: Timer?
     private var periodicQueryTimer: Timer?
 
-    private let movementThreshold: Double = 5.0       // meters
+    private let movementThreshold: Double = 10.0      // meters (above GPS noise floor; typical jitter is 5-7m)
     private let queryInterval: TimeInterval = 15.0     // seconds (while moving)
     private let stationaryDelay: TimeInterval = 30.0   // seconds without movement
 
