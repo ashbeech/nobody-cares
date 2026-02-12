@@ -33,6 +33,9 @@ final class FeedPagerViewController: UIViewController {
     var isPaused: Bool = false
     var currentUserId: UUID?
 
+    /// Per-item range state for proximity overlays. Keyed by content ID.
+    var itemRangeStates: [UUID: RangeState] = [:]
+
     /// True while setContentOffset(animated:true) is in flight.
     private var isProgrammaticScroll = false
     private var isPauseActive = false
@@ -78,7 +81,12 @@ final class FeedPagerViewController: UIViewController {
         if !items.isEmpty {
             collectionView.reloadData()
             mediaPreloader?.updateBuffer(around: currentIndex)
-            mediaPreloader?.activatePlayback(at: currentIndex, isMuted: isMuted, isPaused: isPaused)
+            // Only activate playback if current item is in range
+            let currentId = currentIndex < items.count ? items[currentIndex].id : nil
+            let rangeState = currentId.flatMap { itemRangeStates[$0] } ?? .inRange
+            if rangeState == .inRange {
+                mediaPreloader?.activatePlayback(at: currentIndex, isMuted: isMuted, isPaused: isPaused)
+            }
         }
     }
 
@@ -184,12 +192,28 @@ final class FeedPagerViewController: UIViewController {
             currentIndex = min(currentIndex, items.count - 1)
         }
 
+        // Preserve scroll position after reload. Without this, removing an item
+        // mid-feed can cause the pager to show the wrong page for one frame.
+        let H = collectionView.bounds.height
+        if !items.isEmpty, H > 0 {
+            let expectedOffset = CGFloat(currentIndex) * H
+            if abs(collectionView.contentOffset.y - expectedOffset) > 1 {
+                collectionView.contentOffset = CGPoint(x: 0, y: expectedOffset)
+            }
+        }
+
         // If we just went from 0→N items, scroll to index 0 and start playback
         if oldCount == 0 && !items.isEmpty {
             FeedDebugLogger.log(.pager, "updateItems — 0→\(newItems.count): scrolling to index 0, activating playback")
             collectionView.contentOffset = .zero
+            currentIndex = 0
             mediaPreloader?.updateBuffer(around: 0)
-            mediaPreloader?.activatePlayback(at: 0, isMuted: isMuted, isPaused: isPaused)
+            // Only activate playback if first item is in range
+            let firstId = items[0].id
+            let rangeState = itemRangeStates[firstId] ?? .inRange
+            if rangeState == .inRange {
+                mediaPreloader?.activatePlayback(at: 0, isMuted: isMuted, isPaused: isPaused)
+            }
         }
     }
 
@@ -244,6 +268,29 @@ final class FeedPagerViewController: UIViewController {
 
     func endRefreshing() {
         refreshControl.endRefreshing()
+    }
+
+    /// Update range states and refresh all visible cells to reflect proximity changes.
+    func updateRangeStates(_ states: [UUID: RangeState]) {
+        let changed = states != itemRangeStates
+        itemRangeStates = states
+        if changed {
+            refreshVisibleOverlays()
+
+            // React to current item's range state change
+            if currentIndex < items.count {
+                let currentId = items[currentIndex].id
+                let currentRange = states[currentId] ?? .inRange
+                if currentRange != .inRange {
+                    // gracePeriod or outOfRange — pause playback
+                    // (outOfRange items will be removed from the feed shortly)
+                    mediaPreloader?.pauseAll()
+                } else if let preloader = mediaPreloader, preloader.isReady(currentIndex) {
+                    // inRange and ready — resume playback
+                    preloader.activatePlayback(at: currentIndex, isMuted: isMuted, isPaused: isPaused)
+                }
+            }
+        }
     }
 
     /// True when any scroll is in-flight (user drag, deceleration, or programmatic animation).
@@ -305,7 +352,15 @@ final class FeedPagerViewController: UIViewController {
         // page) was causing unnecessary pause/play cycles that glitched video.
         if pageDidChange {
             mediaPreloader?.updateBuffer(around: currentIndex)
-            mediaPreloader?.activatePlayback(at: currentIndex, isMuted: isMuted, isPaused: isPaused)
+
+            // Playback gating: only autoplay items that are inRange
+            let currentItemId = clamped < items.count ? items[clamped].id : nil
+            let rangeState = currentItemId.flatMap { itemRangeStates[$0] } ?? .inRange
+            if rangeState == .inRange {
+                mediaPreloader?.activatePlayback(at: currentIndex, isMuted: isMuted, isPaused: isPaused)
+            } else {
+                FeedDebugLogger.log(.pager, "handlePageCommit — index \(clamped) is \(rangeState), skipping playback")
+            }
         }
 
         // Always notify that scrolling settled — ViewModel restarts auto-advance
@@ -321,10 +376,16 @@ final class FeedPagerViewController: UIViewController {
         if let cell = collectionView.cellForItem(at: indexPath) as? FeedContentCell {
             configureCell(cell, at: index)
 
-            // If this is the current cell and it's a video, start playback
+            // If this is the current cell and it's a video, start playback (if in range)
             if index == currentIndex {
-                FeedDebugLogger.log(.pager, "readinessChanged — hot-swapping playback for current index \(index)")
-                mediaPreloader?.activatePlayback(at: index, isMuted: isMuted, isPaused: isPaused)
+                let itemId = index < items.count ? items[index].id : nil
+                let rangeState = itemId.flatMap { itemRangeStates[$0] } ?? .inRange
+                if rangeState == .inRange {
+                    FeedDebugLogger.log(.pager, "readinessChanged — hot-swapping playback for current index \(index)")
+                    mediaPreloader?.activatePlayback(at: index, isMuted: isMuted, isPaused: isPaused)
+                } else {
+                    FeedDebugLogger.log(.pager, "readinessChanged — index \(index) is \(rangeState), skipping playback")
+                }
             }
         }
     }
@@ -338,13 +399,17 @@ final class FeedPagerViewController: UIViewController {
         let player = mediaPreloader?.player(for: index)
         let image = mediaPreloader?.image(for: index)
         let isCurrentItem = (index == currentIndex)
+        let ready = mediaPreloader?.isReady(index) ?? false
+        let rangeState = itemRangeStates[item.id] ?? .inRange
 
         cell.configure(
             contentType: item.contentType,
             player: player,
             preloadedImage: image,
             isMuted: isMuted,
-            isPlaying: isCurrentItem && !isPaused && item.contentType == .video
+            isPlaying: isCurrentItem && !isPaused && item.contentType == .video && rangeState != .outOfRange,
+            isReady: ready,
+            rangeState: rangeState
         )
 
         let overlay = ContentOverlayView(

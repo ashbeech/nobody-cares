@@ -4,9 +4,11 @@
 //
 //  Advanced location management for the feed system.
 //
-//  Behaviors (per spec Section 6):
+//  Behaviors:
 //  - kCLLocationAccuracyBest, distanceFilter: 5.0
-//  - Movement detection: re-query feed when moved >5m or every 15s while moving
+//  - Every location update fires onLocationUpdate (cheap display updates)
+//  - Movement detection: re-query feed when moved >25m (accuracy-aware)
+//  - Server refresh cooldown: max once per 3 seconds
 //  - Stationary detection: after 30s without significant movement, switch to
 //    Realtime subscription mode (less battery, server-pushed updates)
 //  - Simulated location detection via CLLocation.sourceInformation
@@ -36,14 +38,6 @@ final class LocationService {
     var isLowAccuracy = false
 
     /// Effective search radius — widened when accuracy is poor.
-    ///
-    /// With GPS accuracy of X meters, the reported position can be up to X m
-    /// from reality.  A 10 m radius centred on a position that's 30 m off
-    /// won't intersect the user's actual location at all.
-    ///
-    /// Scaling to `accuracy × 2` gives ≈95 % confidence the search circle
-    /// covers the real position, while keeping the radius tight (10 m) when
-    /// the fix is good (≤ 5 m accuracy).  Capped at 100 m.
     var effectiveRadius: Double {
         guard let location = currentLocation else { return 10.0 }
         return min(100.0, max(10.0, location.horizontalAccuracy * 2.0))
@@ -51,7 +45,13 @@ final class LocationService {
 
     // MARK: - Callbacks
 
+    /// Fires on EVERY location update — used for cheap display updates (proximity overlays).
+    var onLocationUpdate: ((CLLocation) -> Void)?
+
+    /// Fires when movement exceeds the server refresh threshold — triggers a network fetch.
     var onSignificantMovement: (() -> Void)?
+
+    /// Fires when the user has been stationary for 30s.
     var onBecameStationary: (() -> Void)?
 
     // MARK: - Private
@@ -60,10 +60,12 @@ final class LocationService {
     private let delegate = LocationServiceDelegate()
     private var lastQueryLocation: CLLocation?
     private var lastMovementTime: Date = .now
+    private var lastServerRefreshTime: Date = .distantPast
     private var stationaryTimer: Timer?
     private var periodicQueryTimer: Timer?
 
-    private let movementThreshold: Double = 5.0       // meters
+    private let movementThreshold: Double = 5.0       // meters (CLLocationManager distanceFilter)
+    private let serverRefreshCooldown: TimeInterval = 5.0  // seconds between server refreshes
     private let queryInterval: TimeInterval = 15.0     // seconds (while moving)
     private let stationaryDelay: TimeInterval = 30.0   // seconds without movement
 
@@ -111,7 +113,10 @@ final class LocationService {
         let previousLocation = currentLocation
         currentLocation = location
 
-        // Check for significant movement
+        // ALWAYS fire display update callback — cheap local computation
+        onLocationUpdate?(location)
+
+        // Check for significant movement (for server refresh)
         if let previous = previousLocation {
             let distance = location.distance(from: previous)
             if distance >= movementThreshold {
@@ -141,25 +146,33 @@ final class LocationService {
             }
         }
 
-        // Check if we've moved far enough from last query to warrant a new one.
-        // GPS jitter filter: require the distance to exceed the combined accuracy
-        // of both readings.  Without this, a static device with 5 m accuracy
-        // continuously reports 5-9 m of "movement", triggering re-queries that
-        // swap feed content in and out.
+        // Check if we've moved far enough from last query to warrant a server refresh.
+        // Uses accuracy-aware threshold: max(25m, 2 * accuracyFloor)
+        // This ensures re-queries only happen on genuine movement well beyond the
+        // exit radius (18m), not GPS jitter.
         if let lastQuery = lastQueryLocation {
             let distanceFromLastQuery = current.distance(from: lastQuery)
-            let accuracyFloor = lastQuery.horizontalAccuracy + current.horizontalAccuracy
-            let effectiveThreshold = max(movementThreshold, accuracyFloor)
+            let accuracyFloor = max(lastQuery.horizontalAccuracy, current.horizontalAccuracy)
+            let effectiveThreshold = max(25.0, 2.0 * accuracyFloor)
+
             if distanceFromLastQuery >= effectiveThreshold {
-                FeedDebugLogger.log(.loc, "significantMovement — \(String(format: "%.1f", distanceFromLastQuery))m from last query (threshold=\(String(format: "%.1f", effectiveThreshold))m) → re-querying")
-                lastQueryLocation = current
-                onSignificantMovement?()
+                // Enforce server refresh cooldown
+                let timeSinceLastRefresh = Date().timeIntervalSince(lastServerRefreshTime)
+                if timeSinceLastRefresh >= serverRefreshCooldown {
+                    FeedDebugLogger.log(.loc, "significantMovement — \(String(format: "%.1f", distanceFromLastQuery))m from last query (threshold=\(String(format: "%.1f", effectiveThreshold))m) → re-querying")
+                    lastQueryLocation = current
+                    lastServerRefreshTime = Date()
+                    onSignificantMovement?()
+                } else {
+                    FeedDebugLogger.log(.loc, "significantMovement — \(String(format: "%.1f", distanceFromLastQuery))m moved but cooldown active (\(String(format: "%.1f", timeSinceLastRefresh))s < \(serverRefreshCooldown)s)")
+                }
             } else {
                 FeedDebugLogger.log(.loc, "movement — \(String(format: "%.1f", distanceFromLastQuery))m from last query (below accuracy-aware threshold \(String(format: "%.1f", effectiveThreshold))m)")
             }
         } else {
             FeedDebugLogger.log(.loc, "significantMovement — first query location set")
             lastQueryLocation = current
+            lastServerRefreshTime = Date()
             onSignificantMovement?()
         }
     }
@@ -177,18 +190,23 @@ final class LocationService {
             Task { @MainActor in
                 guard let self, self.movementState == .moving else { return }
 
-                // Same accuracy-aware gate as handleMovement: don't re-query
-                // if we haven't genuinely moved since the last query.
+                // Same accuracy-aware gate as handleMovement
                 if let current = self.currentLocation, let lastQuery = self.lastQueryLocation {
                     let distance = current.distance(from: lastQuery)
-                    let accuracyFloor = lastQuery.horizontalAccuracy + current.horizontalAccuracy
-                    let effectiveThreshold = max(self.movementThreshold, accuracyFloor)
+                    let accuracyFloor = max(lastQuery.horizontalAccuracy, current.horizontalAccuracy)
+                    let effectiveThreshold = max(25.0, 2.0 * accuracyFloor)
                     guard distance >= effectiveThreshold else {
                         FeedDebugLogger.log(.loc, "⏱ periodicQuery — \(self.queryInterval)s timer fired but \(String(format: "%.1f", distance))m < accuracy-aware threshold \(String(format: "%.1f", effectiveThreshold))m → skipping")
                         return
                     }
+
+                    // Enforce cooldown
+                    let timeSinceLastRefresh = Date().timeIntervalSince(self.lastServerRefreshTime)
+                    guard timeSinceLastRefresh >= self.serverRefreshCooldown else { return }
+
                     FeedDebugLogger.log(.loc, "⏱ periodicQuery — \(self.queryInterval)s timer fired, \(String(format: "%.1f", distance))m from last query → re-querying")
                     self.lastQueryLocation = current
+                    self.lastServerRefreshTime = Date()
                 } else {
                     FeedDebugLogger.log(.loc, "⏱ periodicQuery — \(self.queryInterval)s timer fired (state=moving)")
                 }

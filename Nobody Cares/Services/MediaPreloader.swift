@@ -2,9 +2,11 @@
 //  MediaPreloader.swift
 //  Nobody Cares
 //
-//  Manages a reusable pool of 3 AVPlayers (prev / current / next) and
+//  Manages a reusable pool of 5 AVPlayers (±2 around current) and
 //  pre-downloads images so adjacent feed items are ready before the user
 //  lands on them. Exposes per-index readiness for the paging gate.
+//
+//  v2: Thumbnail-first preloading, placeholder fallback, retry/backoff.
 //
 
 import AVFoundation
@@ -19,9 +21,13 @@ final class MediaPreloader {
     private let pool: [AVPlayer] = [AVPlayer(), AVPlayer(), AVPlayer(), AVPlayer(), AVPlayer()]
     private var slotAssignments: [Int: Int] = [:]  // contentIndex → poolSlot
 
-    // MARK: - Preloaded Images (poster frames for video, full images for photos)
+    // MARK: - Preloaded Images (thumbnail / poster / placeholder — always non-nil via image(for:))
 
     private(set) var images: [Int: UIImage] = [:]
+
+    // MARK: - Thumbnail Cache (persists across refreshes, keyed by content ID)
+
+    private let thumbnailCache = NSCache<NSString, UIImage>()
 
     // MARK: - Readiness Tracking
 
@@ -39,6 +45,40 @@ final class MediaPreloader {
     /// Fires when an index finishes preparation. Use to hot-swap visible cells.
     var onReadinessChanged: ((_ index: Int, _ ready: Bool) -> Void)?
 
+    // MARK: - Retry Config
+
+    private let maxAttempts = 2
+    private let backoffSeconds: [Double] = [0.0, 2.0]
+    private let pollTimeoutSeconds: TimeInterval = 10
+
+    // MARK: - Placeholder
+
+    /// A dark-gray retro placeholder — never black, generated once and reused.
+    static let placeholder: UIImage = {
+        let size = CGSize(width: 360, height: 640)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { ctx in
+            // Dark gray background (not black)
+            UIColor(white: 0.12, alpha: 1.0).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+
+            // Draw a subtle retro grid pattern
+            UIColor(white: 0.18, alpha: 1.0).setStroke()
+            let path = UIBezierPath()
+            let spacing: CGFloat = 20
+            for x in stride(from: 0, through: size.width, by: spacing) {
+                path.move(to: CGPoint(x: x, y: 0))
+                path.addLine(to: CGPoint(x: x, y: size.height))
+            }
+            for y in stride(from: 0, through: size.height, by: spacing) {
+                path.move(to: CGPoint(x: 0, y: y))
+                path.addLine(to: CGPoint(x: size.width, y: y))
+            }
+            path.lineWidth = 0.5
+            path.stroke()
+        }
+    }()
+
     // MARK: - Public: Query
 
     func isReady(_ index: Int) -> Bool {
@@ -50,8 +90,21 @@ final class MediaPreloader {
         return pool[slot]
     }
 
+    /// Always returns a non-nil image: preloaded thumbnail > cached thumbnail > placeholder.
     func image(for index: Int) -> UIImage? {
-        images[index]
+        if let img = images[index] { return img }
+
+        // Check NSCache by content ID (persists across refreshes)
+        if index < items.count {
+            let cacheKey = items[index].id.uuidString as NSString
+            if let cached = thumbnailCache.object(forKey: cacheKey) {
+                images[index] = cached
+                return cached
+            }
+        }
+
+        // Always return placeholder — never nil, never black
+        return Self.placeholder
     }
 
     // MARK: - Public: Data
@@ -124,6 +177,14 @@ final class MediaPreloader {
 
     // MARK: - Public: Playback Control
 
+    /// Pause all assigned players without starting any.
+    func pauseAll() {
+        FeedDebugLogger.log(.media, "⏸ pauseAll — pausing \(slotAssignments.count) assigned players")
+        for (_, slot) in slotAssignments {
+            pool[slot].pause()
+        }
+    }
+
     /// Activate playback for the given index and pause all others.
     func activatePlayback(at index: Int, isMuted: Bool, isPaused: Bool) {
         // Pause every assigned player first
@@ -131,19 +192,21 @@ final class MediaPreloader {
             pool[slot].pause()
         }
 
-        // Play the target if it's a video
-        guard index < items.count, items[index].contentType == .video else { return }
-        if let slot = slotAssignments[index] {
-            let player = pool[slot]
-            player.isMuted = isMuted
-            if !isPaused {
-                FeedDebugLogger.log(.media, "▶ activatePlayback — index \(index) slot \(slot) (muted=\(isMuted))")
-                player.play()
-            } else {
-                FeedDebugLogger.log(.media, "⏸ activatePlayback — index \(index) slot \(slot) PAUSED")
-            }
-        } else {
+        // Bounds check — split guards for clarity and safety
+        guard index >= 0, index < items.count else { return }
+        guard items[index].contentType == .video else { return }
+        guard let slot = slotAssignments[index] else {
             FeedDebugLogger.log(.media, "activatePlayback — index \(index) has no slot assigned (not ready?)")
+            return
+        }
+
+        let player = pool[slot]
+        player.isMuted = isMuted
+        if !isPaused {
+            FeedDebugLogger.log(.media, "▶ activatePlayback — index \(index) slot \(slot) (muted=\(isMuted))")
+            player.play()
+        } else {
+            FeedDebugLogger.log(.media, "⏸ activatePlayback — index \(index) slot \(slot) PAUSED")
         }
     }
 
@@ -182,7 +245,7 @@ final class MediaPreloader {
             case .image:
                 await self.prepareImage(at: index, url: item.signedURL)
             case .video:
-                await self.prepareVideo(at: index, url: item.signedURL)
+                await self.prepareVideo(at: index, url: item.signedURL, thumbnailURL: item.thumbnailURL)
             }
 
             self.preparationTasks[index] = nil
@@ -218,9 +281,14 @@ final class MediaPreloader {
             guard !Task.isCancelled else { return }
             if let img = UIImage(data: data) {
                 images[index] = img
+                // Cache by content ID
+                if index < items.count {
+                    thumbnailCache.setObject(img, forKey: items[index].id.uuidString as NSString)
+                }
             }
         } catch {
-            // Non-fatal — cell will show a placeholder
+            FeedDebugLogger.log(.media, "prepareImage(\(index)) — download failed: \(error.localizedDescription)")
+            // Non-fatal — cell will show placeholder via image(for:)
         }
 
         guard !Task.isCancelled else { return }
@@ -230,14 +298,14 @@ final class MediaPreloader {
     // MARK: - Private: Video Preparation
 
     @MainActor
-    private func prepareVideo(at index: Int, url: URL?) async {
+    private func prepareVideo(at index: Int, url: URL?, thumbnailURL: URL?) async {
         guard let url else {
             markReady(index)
             return
         }
 
-        // 1) Generate first-frame poster (so the cell can display something instantly)
-        await generatePoster(at: index, url: url)
+        // 1) Preload thumbnail from server (fast, lightweight — replaces remote poster extraction)
+        await preloadThumbnail(at: index, thumbnailURL: thumbnailURL)
         guard !Task.isCancelled else { return }
 
         // 2) Acquire a pool slot and prime the AVPlayer
@@ -254,48 +322,109 @@ final class MediaPreloader {
 
         guard !Task.isCancelled else { return }
 
-        // 3) Wait until AVPlayerItem reaches .readyToPlay (or fails / times out)
-        _ = await pollForReady(playerItem)
+        // 3) Wait until AVPlayerItem reaches .readyToPlay with retry/backoff
+        var didBecomeReady = false
+        for attempt in 0..<maxAttempts {
+            if attempt > 0 {
+                FeedDebugLogger.log(.media, "prepareVideo(\(index)) — retry attempt \(attempt) after \(backoffSeconds[attempt])s backoff")
+                try? await Task.sleep(for: .seconds(backoffSeconds[attempt]))
+                guard !Task.isCancelled else { return }
+
+                // Re-create player item for retry
+                let retryItem = AVPlayerItem(url: url)
+                retryItem.preferredForwardBufferDuration = 3.0
+                player.replaceCurrentItem(with: retryItem)
+                guard !Task.isCancelled else { return }
+            }
+
+            let currentItem = player.currentItem ?? playerItem
+            let ready = await pollForReady(currentItem)
+            guard !Task.isCancelled else { return }
+
+            if ready && currentItem.error == nil {
+                didBecomeReady = true
+                FeedDebugLogger.log(.media, "prepareVideo(\(index)) — ready after attempt \(attempt)")
+                break
+            } else {
+                FeedDebugLogger.log(.media, "prepareVideo(\(index)) — attempt \(attempt) FAILED (status=\(currentItem.status.rawValue), error=\(currentItem.error?.localizedDescription ?? "nil"))")
+            }
+        }
+
         guard !Task.isCancelled else { return }
 
-        // 4) Loop observer — seek to start and replay when the item ends
-        let observer = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: playerItem,
-            queue: .main
-        ) { [weak player] _ in
-            player?.seek(to: .zero)
-            player?.play()
-        }
-        loopObservers[index] = observer
+        // 4) Only mark ready and set up loop observer if actually ready
+        if didBecomeReady {
+            // Loop observer — seek to start and replay when the item ends
+            if let currentItem = player.currentItem {
+                let observer = NotificationCenter.default.addObserver(
+                    forName: .AVPlayerItemDidPlayToEndTime,
+                    object: currentItem,
+                    queue: .main
+                ) { [weak player] _ in
+                    player?.seek(to: .zero)
+                    player?.play()
+                }
+                loopObservers[index] = observer
+            }
 
-        markReady(index)
+            markReady(index)
+        } else {
+            // All attempts failed — do NOT mark ready.
+            // Release the slot so a dead player can't be accidentally activated.
+            // The cell shows thumbnail + loading overlay.
+            // Observers are not added for failed items.
+            releaseSlot(for: index)
+            FeedDebugLogger.log(.media, "⚠️ prepareVideo(\(index)) — all \(maxAttempts) attempts FAILED, slot released, item left unready")
+        }
     }
 
+    /// Preload thumbnail image from server-provided signed URL.
+    /// Falls back to placeholder (via image(for:)) if download fails.
     @MainActor
-    private func generatePoster(at index: Int, url: URL) async {
-        let asset = AVAsset(url: url)
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceAfter = .zero
-        generator.requestedTimeToleranceBefore = .zero
-        generator.maximumSize = CGSize(width: 1080, height: 1920)
+    private func preloadThumbnail(at index: Int, thumbnailURL: URL?) async {
+        // Check NSCache first
+        if index < items.count {
+            let cacheKey = items[index].id.uuidString as NSString
+            if let cached = thumbnailCache.object(forKey: cacheKey) {
+                images[index] = cached
+                FeedDebugLogger.log(.media, "thumbnail(\(index)) — cache HIT")
+                return
+            }
+        }
 
-        if let result = try? await generator.image(at: .zero) {
+        guard let thumbnailURL else {
+            FeedDebugLogger.log(.media, "thumbnail(\(index)) — no URL, using placeholder")
+            return
+        }
+
+        do {
+            let (data, _) = try await URLSession.shared.data(from: thumbnailURL)
             guard !Task.isCancelled else { return }
-            images[index] = UIImage(cgImage: result.image)
+            if let img = UIImage(data: data) {
+                images[index] = img
+                // Cache by content ID
+                if index < items.count {
+                    thumbnailCache.setObject(img, forKey: items[index].id.uuidString as NSString)
+                }
+                FeedDebugLogger.log(.media, "thumbnail(\(index)) — preloaded OK")
+            } else {
+                FeedDebugLogger.log(.media, "thumbnail(\(index)) — data not decodable as image")
+            }
+        } catch {
+            FeedDebugLogger.log(.media, "thumbnail(\(index)) — download failed: \(error.localizedDescription)")
+            // Placeholder will be used via image(for:)
         }
     }
 
     /// Polls AVPlayerItem.status every 50 ms up to a 10-second timeout.
     @MainActor
     private func pollForReady(_ item: AVPlayerItem) async -> Bool {
-        let deadline = Date().addingTimeInterval(10)
+        let deadline = Date().addingTimeInterval(pollTimeoutSeconds)
         while item.status == .unknown, Date() < deadline {
             if Task.isCancelled { return false }
             try? await Task.sleep(for: .milliseconds(50))
         }
-        return item.status == .readyToPlay
+        return item.status == .readyToPlay && item.error == nil
     }
 
     // MARK: - Private: Pool Slot Management

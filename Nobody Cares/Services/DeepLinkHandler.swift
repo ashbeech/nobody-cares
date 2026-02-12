@@ -124,6 +124,7 @@ final class DeepLinkHandler {
                 contentType: ContentType(rawValue: row.contentType) ?? .image,
                 durationMs: row.durationMs,
                 mediaPath: mediaPath,
+                thumbnailPath: nil,
                 distanceMeters: distance,
                 captureLat: nil,
                 captureLng: nil,

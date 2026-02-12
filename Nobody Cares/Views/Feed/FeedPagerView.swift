@@ -78,6 +78,12 @@ struct FeedPagerView: UIViewControllerRepresentable {
             vc.updateItems(viewModel.items)
         }
 
+        // Range states — push proximity overlay changes to pager
+        if coord.lastRangeStates != viewModel.itemRangeStates {
+            coord.lastRangeStates = viewModel.itemRangeStates
+            vc.updateRangeStates(viewModel.itemRangeStates)
+        }
+
         // Mute
         if coord.lastMuted != viewModel.isMuted {
             coord.lastMuted = viewModel.isMuted
@@ -131,5 +137,6 @@ struct FeedPagerView: UIViewControllerRepresentable {
         var lastMuted: Bool = true
         var lastPaused: Bool = false
         var wasRefreshing: Bool = false
+        var lastRangeStates: [UUID: RangeState] = [:]
     }
 }

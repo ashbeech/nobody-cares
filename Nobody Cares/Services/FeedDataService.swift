@@ -100,11 +100,11 @@ final class FeedDataService {
 
     // MARK: - Signed URL Generation
 
-    /// Generate short-lived (1 hour) signed URLs for content items.
+    /// Generate short-lived (1 hour) signed URLs for content items (media + thumbnails).
     private func generateSignedURLs(for items: [ContentItem]) async -> [ContentItem] {
         var updatedItems = items
 
-        // Batch generate signed URLs
+        // --- Media signed URLs ---
         let paths = items.map(\.mediaPath)
 
         do {
@@ -125,6 +125,45 @@ final class FeedDataService {
                     updatedItems[index].signedURL = url
                 } catch {
                     // Skip items where URL generation fails
+                }
+            }
+        }
+
+        // --- Thumbnail signed URLs ---
+        let thumbnailPaths = updatedItems.compactMap { $0.thumbnailPath }
+        if !thumbnailPaths.isEmpty {
+            do {
+                let thumbnailURLs = try await supabase.storage
+                    .from("thumbnails")
+                    .createSignedURLs(paths: thumbnailPaths, expiresIn: 3600)
+
+                // Map signed URLs back by matching paths
+                var urlByPath: [String: URL] = [:]
+                for (i, path) in thumbnailPaths.enumerated() where i < thumbnailURLs.count {
+                    urlByPath[path] = thumbnailURLs[i]
+                }
+                for index in updatedItems.indices {
+                    if let thumbPath = updatedItems[index].thumbnailPath,
+                       let url = urlByPath[thumbPath] {
+                        updatedItems[index].thumbnailURL = url
+                    }
+                }
+                FeedDebugLogger.log(.data, "thumbnail signed URLs generated for \(thumbnailPaths.count) items")
+            } catch {
+                // Non-fatal: feed works without thumbnails
+                FeedDebugLogger.log(.data, "thumbnail signed URL batch failed: \(error.localizedDescription)")
+                // Try individual fallback
+                for index in updatedItems.indices {
+                    if let thumbPath = updatedItems[index].thumbnailPath {
+                        do {
+                            let url = try await supabase.storage
+                                .from("thumbnails")
+                                .createSignedURL(path: thumbPath, expiresIn: 3600)
+                            updatedItems[index].thumbnailURL = url
+                        } catch {
+                            // Skip — placeholder will be shown
+                        }
+                    }
                 }
             }
         }
