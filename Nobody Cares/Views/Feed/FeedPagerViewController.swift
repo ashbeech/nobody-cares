@@ -259,6 +259,21 @@ final class FeedPagerViewController: UIViewController {
         isMuted = muted
         mediaPreloader?.updateMute(muted, currentIndex: currentIndex)
         refreshVisibleOverlays()
+
+        // Also update adjacent cells (currentIndex ± 1). UICollectionView
+        // pre-lays-out neighbors for smooth scrolling, but with full-screen
+        // cells they're off-screen and excluded from indexPathsForVisibleItems.
+        // Without this, the next/prev cell keeps its stale overlay until
+        // handlePageCommit fires after the swipe settles — visible as a
+        // split-second flash of the wrong mute icon.
+        for offset in [-1, 1] {
+            let idx = currentIndex + offset
+            guard idx >= 0, idx < items.count else { continue }
+            let indexPath = IndexPath(item: idx, section: 0)
+            if let cell = collectionView.cellForItem(at: indexPath) as? FeedContentCell {
+                configureCell(cell, at: idx)
+            }
+        }
     }
 
     func updatePauseState(_ paused: Bool) {
@@ -361,6 +376,8 @@ final class FeedPagerViewController: UIViewController {
             } else {
                 FeedDebugLogger.log(.pager, "handlePageCommit — index \(clamped) is \(rangeState), skipping playback")
             }
+
+            refreshVisibleOverlays()
         }
 
         // Always notify that scrolling settled — ViewModel restarts auto-advance

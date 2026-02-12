@@ -157,6 +157,18 @@ struct FeedView: View {
         .onChange(of: viewModel.feedState) { _, newState in
             // No drag state to reset — pager handles its own scroll state
         }
+        // Case B: Report — pause BOTH timer and video
+        .onChange(of: showReport) { _, isShowing in
+            viewModel.setPaused(isShowing)
+        }
+        // Case B: Block — pause BOTH timer and video
+        .onChange(of: showBlockConfirm) { _, isShowing in
+            viewModel.setPaused(isShowing)
+        }
+        // Case A: End-of-feed alert — pause timer ONLY, video keeps playing
+        .onChange(of: viewModel.showEndOfFeedAlert) { _, isShowing in
+            viewModel.isTimerPaused = isShowing
+        }
         .retroDialog(isPresented: $showBlockConfirm) {
             RetroDialog(
                 title: "BLOCK USER",
