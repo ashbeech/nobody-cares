@@ -137,6 +137,7 @@ struct FeedView: View {
             if showBlockedBanner {
                 blockedBanner
             }
+
         }
         .animation(.linear(duration: 0.2), value: showReport)
         .animation(.linear(duration: 0.2), value: viewModel.showEndOfFeedAlert)

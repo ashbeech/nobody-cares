@@ -22,6 +22,8 @@ struct ContentItem: Identifiable, Codable {
     let durationMs: Int?
     let mediaPath: String        // Storage object key (e.g. "originals/2026/02/11/uuid.heif")
     let distanceMeters: Double
+    let captureLat: Double?      // Latitude where content was captured (for dev radar)
+    let captureLng: Double?      // Longitude where content was captured (for dev radar)
     let createdAt: Date
 
     /// Signed URL generated client-side from mediaPath — not persisted
@@ -35,6 +37,8 @@ struct ContentItem: Identifiable, Codable {
         case durationMs = "duration_ms"
         case mediaPath = "media_path"
         case distanceMeters = "distance_meters"
+        case captureLat = "capture_lat"
+        case captureLng = "capture_lng"
         case createdAt = "created_at"
     }
 }

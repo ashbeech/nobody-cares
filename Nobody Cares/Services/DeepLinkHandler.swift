@@ -125,6 +125,8 @@ final class DeepLinkHandler {
                 durationMs: row.durationMs,
                 mediaPath: mediaPath,
                 distanceMeters: distance,
+                captureLat: nil,
+                captureLng: nil,
                 createdAt: .now
             )
             item.signedURL = signedURL

@@ -99,17 +99,20 @@ final class FeedViewModel {
     // MARK: - Lifecycle
 
     func startFeed() {
+        FeedDebugLogger.log(.feed, "startFeed() called — setting state to .loading")
         feedState = .loading
 
         // Set up location callbacks
         locationService.onSignificantMovement = { [weak self] in
             Task { @MainActor in
+                FeedDebugLogger.log(.feed, "⚡ onSignificantMovement callback — triggering refreshFromLocation")
                 await self?.refreshFromLocation()
             }
         }
 
         locationService.onBecameStationary = { [weak self] in
             Task { @MainActor in
+                FeedDebugLogger.log(.feed, "⚡ onBecameStationary callback — switching to Realtime mode")
                 await self?.switchToRealtimeMode()
             }
         }
@@ -121,22 +124,27 @@ final class FeedViewModel {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                FeedDebugLogger.log(.feed, "⚡ Realtime notification: newNearbyContentAvailable — refreshing")
                 await self?.refreshFromLocation()
             }
         }
 
         // Start location monitoring
         locationService.startMonitoring()
+        FeedDebugLogger.log(.feed, "Location monitoring started")
 
         // Initial load with a brief delay for first location fix
         Task {
+            FeedDebugLogger.log(.feed, "Waiting 1s for first GPS fix…")
             // Wait briefly for first GPS fix
             try? await Task.sleep(for: .seconds(1))
+            FeedDebugLogger.log(.feed, "GPS wait complete — calling refreshFromLocation")
             await refreshFromLocation()
         }
     }
 
     func stopFeed() {
+        FeedDebugLogger.log(.feed, "stopFeed() — tearing down location, timers, preloader")
         locationService.stopMonitoring()
         stopAutoAdvance()
         mediaPreloader.cancelAll()
@@ -150,19 +158,27 @@ final class FeedViewModel {
         // Don't refresh while the end-of-feed alert is showing.
         // Background events (location, Realtime) must not mutate feed state
         // underneath the alert — the user must act first.
-        guard !showEndOfFeedAlert else { return }
+        guard !showEndOfFeedAlert else {
+            FeedDebugLogger.log(.feed, "refreshFromLocation — SKIPPED (endOfFeedAlert is showing)")
+            return
+        }
 
         guard let location = locationService.currentLocation else {
+            FeedDebugLogger.log(.feed, "refreshFromLocation — no currentLocation, attempting fetchCurrentLocation")
             // Try to get a location
             let fetched = await locationService.fetchCurrentLocation()
             if fetched == nil {
+                FeedDebugLogger.log(.feed, "refreshFromLocation — fetchCurrentLocation FAILED, showing error")
                 AnalyticsService.shared.track(.locationUnavailable, metadata: ["source": "feed"])
                 feedState = .error("NO SIGNAL. CONTENT IS PATIENT. Move to an area with GPS signal.")
+            } else {
+                FeedDebugLogger.log(.feed, "refreshFromLocation — fetchCurrentLocation succeeded, but returning (will retry)")
             }
             return
         }
 
         let radius = locationService.effectiveRadius
+        FeedDebugLogger.log(.feed, "refreshFromLocation — lat=\(location.coordinate.latitude) lng=\(location.coordinate.longitude) radius=\(radius)m")
 
         await feedDataService.refresh(
             latitude: location.coordinate.latitude,
@@ -171,18 +187,30 @@ final class FeedViewModel {
         )
 
         if let error = feedDataService.error {
+            FeedDebugLogger.log(.feed, "refreshFromLocation — ERROR: \(error)", detail: "existingItems=\(items.count)")
             AnalyticsService.shared.track(.networkError, metadata: ["source": "feed", "error": error])
             if items.isEmpty {
                 feedState = .error("NO SIGNAL. CONTENT IS PATIENT. Check your connection and try again.")
             }
             // If we already have content, silently ignore the error
         } else if feedDataService.items.isEmpty {
-            items = []
-            mediaPreloader.cancelAll()
-            feedState = .empty
+            if !items.isEmpty {
+                // GPS jitter guard: we had content, but this refresh returned nothing.
+                // Indoor GPS can drift 10-65m, pushing us outside the small radius.
+                // Keep existing content instead of flashing the empty state.
+                FeedDebugLogger.log(.feed, "refreshFromLocation — EMPTY result but had \(items.count) items → KEEPING existing content (GPS jitter guard)")
+            } else {
+                FeedDebugLogger.log(.feed, "refreshFromLocation — EMPTY result (first load), showing empty state")
+                feedState = .empty
+            }
         } else {
             let hadContent = !items.isEmpty
             let newItems = feedDataService.items
+            FeedDebugLogger.log(.feed, "refreshFromLocation — GOT \(newItems.count) items (had \(items.count))", detail: "hadContent=\(hadContent)")
+            for (i, item) in newItems.enumerated() {
+                FeedDebugLogger.log(.feed, "  [\(i)] \(item.contentType.rawValue) id=\(item.id.uuidString.prefix(8))… dist=\(String(format: "%.1f", item.distanceMeters))m @\(item.username)")
+            }
+
             mediaPreloader.setItems(newItems)
             items = newItems
 
@@ -192,13 +220,16 @@ final class FeedViewModel {
             if hadContent {
                 // Smart: preserve current index if in bounds
                 if currentIndex >= items.count {
+                    let oldIdx = currentIndex
                     currentIndex = max(0, items.count - 1)
+                    FeedDebugLogger.log(.feed, "refreshFromLocation — clamped currentIndex \(oldIdx)→\(currentIndex)")
                 }
                 mediaPreloader.updateBuffer(around: currentIndex)
             } else {
                 currentIndex = 0
                 progress = 0.0
                 feedState = .content
+                FeedDebugLogger.log(.feed, "refreshFromLocation — first load, starting auto-advance from index 0")
                 mediaPreloader.updateBuffer(around: 0)
                 startAutoAdvance()
             }
@@ -209,13 +240,21 @@ final class FeedViewModel {
 
     @MainActor
     func smartRefresh() {
-        guard !isRefreshing else { return }
+        guard !isRefreshing else {
+            FeedDebugLogger.log(.feed, "smartRefresh — SKIPPED (already refreshing)")
+            return
+        }
         isRefreshing = true
+        FeedDebugLogger.log(.feed, "smartRefresh — START (pull-to-refresh)")
 
         Task {
-            defer { isRefreshing = false }
+            defer {
+                isRefreshing = false
+                FeedDebugLogger.log(.feed, "smartRefresh — DONE")
+            }
 
             guard let location = locationService.currentLocation else {
+                FeedDebugLogger.log(.feed, "smartRefresh — no location available")
                 let fetched = await locationService.fetchCurrentLocation()
                 if fetched == nil && items.isEmpty {
                     feedState = .error("NO SIGNAL. CONTENT IS PATIENT. Move to an area with GPS signal.")
@@ -224,6 +263,7 @@ final class FeedViewModel {
             }
 
             let radius = locationService.effectiveRadius
+            FeedDebugLogger.log(.feed, "smartRefresh — fetching at lat=\(location.coordinate.latitude) lng=\(location.coordinate.longitude) r=\(radius)m")
 
             do {
                 let newItems = try await feedDataService.fetchNearbyContent(
@@ -236,15 +276,22 @@ final class FeedViewModel {
                 let newIds = newItems.map(\.id)
 
                 if existingIds == newIds {
+                    FeedDebugLogger.log(.feed, "smartRefresh — SAME \(newItems.count) items (URLs refreshed silently)")
                     // Same items — silently update signed URLs without any visual change
                     mediaPreloader.setItems(newItems)
                     items = newItems
                     // Don't clear end-of-feed alert — content is identical
                 } else if newItems.isEmpty {
+                    FeedDebugLogger.log(.feed, "smartRefresh — EMPTY result (was \(items.count))")
                     items = []
                     mediaPreloader.cancelAll()
                     feedState = .empty
                 } else {
+                    FeedDebugLogger.log(.feed, "smartRefresh — DIFFERENT content: \(items.count)→\(newItems.count) items")
+                    for (i, item) in newItems.enumerated() {
+                        FeedDebugLogger.log(.feed, "  [\(i)] \(item.contentType.rawValue) id=\(item.id.uuidString.prefix(8))… dist=\(String(format: "%.1f", item.distanceMeters))m")
+                    }
+
                     // Different content — update in-place
                     if showEndOfFeedAlert { showEndOfFeedAlert = false }
                     let currentItemId = currentIndex < items.count ? items[currentIndex].id : nil
@@ -255,8 +302,10 @@ final class FeedViewModel {
                     // Try to keep the user on the same item
                     if let cid = currentItemId,
                        let newIdx = newItems.firstIndex(where: { $0.id == cid }) {
+                        FeedDebugLogger.log(.feed, "smartRefresh — preserved position at index \(newIdx)")
                         currentIndex = newIdx
                     } else {
+                        FeedDebugLogger.log(.feed, "smartRefresh — current item gone, resetting to index 0")
                         currentIndex = 0
                     }
 
@@ -271,6 +320,7 @@ final class FeedViewModel {
                 feedDataService.items = newItems
                 feedDataService.error = nil
             } catch {
+                FeedDebugLogger.log(.feed, "smartRefresh — NETWORK ERROR: \(error.localizedDescription)")
                 // Don't overwrite existing content on error
                 if items.isEmpty {
                     feedState = .error("NO SIGNAL. CONTENT IS PATIENT. Check your connection and try again.")
@@ -285,10 +335,14 @@ final class FeedViewModel {
         // Never start a timer when there's no content to advance through.
         // This prevents the timer from firing on the empty/error view and
         // accidentally triggering showEndOfFeedAlert.
-        guard feedState == .content, !items.isEmpty else { return }
+        guard feedState == .content, !items.isEmpty else {
+            FeedDebugLogger.log(.feed, "startAutoAdvance — SKIPPED (state=\(feedState), items=\(items.count))")
+            return
+        }
 
         stopAutoAdvance()
         progress = 0.0
+        FeedDebugLogger.log(.feed, "⏱ startAutoAdvance — 6s timer started at index \(currentIndex)/\(items.count - 1)")
 
         // Progress update at ~60fps
         progressTimer = Timer.scheduledTimer(withTimeInterval: progressInterval, repeats: true) { [weak self] _ in
@@ -303,6 +357,9 @@ final class FeedViewModel {
     }
 
     func stopAutoAdvance() {
+        if progressTimer != nil || autoAdvanceTimer != nil {
+            FeedDebugLogger.log(.feed, "⏱ stopAutoAdvance — timers invalidated")
+        }
         progressTimer?.invalidate()
         progressTimer = nil
         autoAdvanceTimer?.invalidate()
@@ -314,6 +371,7 @@ final class FeedViewModel {
     func advanceToNext() {
         // Never auto-advance on an empty feed — nothing to advance to.
         guard !items.isEmpty else {
+            FeedDebugLogger.log(.feed, "advanceToNext — SKIPPED (empty feed)")
             stopAutoAdvance()
             return
         }
@@ -329,6 +387,7 @@ final class FeedViewModel {
         guard currentIndex < items.count - 1 else {
             // At last item — stop timer permanently, show end-of-feed alert.
             // Content keeps looping in background; no navigation or restart.
+            FeedDebugLogger.log(.feed, "▶ advanceToNext — REACHED END at index \(currentIndex)/\(items.count - 1), showing endOfFeedAlert")
             stopAutoAdvance()
             progress = 0.0
             showEndOfFeedAlert = true
@@ -338,8 +397,11 @@ final class FeedViewModel {
         // Readiness gate for auto-advance only: don't advance onto an unprepared item.
         // The timer keeps firing so this retries every frame until ready.
         guard mediaPreloader.isReady(currentIndex + 1) else {
+            // Only log once per second to avoid spam (progress is near 1.0)
             return
         }
+
+        FeedDebugLogger.log(.feed, "▶ advanceToNext — \(currentIndex)→\(currentIndex + 1) of \(items.count)")
 
         // Stop the timer now. It will be restarted by onPagerScrollSettled
         // once the scroll animation completes — giving a clean 6-second window.
@@ -351,11 +413,13 @@ final class FeedViewModel {
 
     func goToPrevious() {
         guard currentIndex > 0 else { return }
+        FeedDebugLogger.log(.feed, "◀ goToPrevious — \(currentIndex)→\(currentIndex - 1)")
         currentIndex -= 1
         progress = 0.0
     }
 
     func refresh() {
+        FeedDebugLogger.log(.feed, "refresh() called — items=\(items.count)")
         if items.isEmpty {
             // No existing content — show loading
             feedState = .loading
@@ -367,10 +431,12 @@ final class FeedViewModel {
 
     func toggleMute() {
         isMuted.toggle()
+        FeedDebugLogger.log(.feed, "toggleMute → \(isMuted ? "MUTED" : "UNMUTED")")
     }
 
     func goToFirst() {
         guard !items.isEmpty else { return }
+        FeedDebugLogger.log(.feed, "goToFirst — jumping to index 0 from \(currentIndex)")
         currentIndex = 0
         progress = 0.0
         feedState = .content
@@ -379,6 +445,7 @@ final class FeedViewModel {
 
     func goToLast() {
         guard !items.isEmpty else { return }
+        FeedDebugLogger.log(.feed, "goToLast — jumping to index \(items.count - 1) from \(currentIndex)")
         currentIndex = items.count - 1
         progress = 0.0
         feedState = .content
@@ -386,6 +453,7 @@ final class FeedViewModel {
     }
 
     func setPaused(_ paused: Bool) {
+        FeedDebugLogger.log(.feed, "setPaused(\(paused))")
         isPaused = paused
     }
 
@@ -394,11 +462,13 @@ final class FeedViewModel {
     /// The pager's scroll settled on a new index.
     func onPagerIndexChanged(_ index: Int) {
         guard index != currentIndex else { return }
+        FeedDebugLogger.log(.feed, "onPagerIndexChanged — \(currentIndex)→\(index)")
         currentIndex = index
         progress = 0.0
 
         // User navigated away from last item — clear end-of-feed alert
         if showEndOfFeedAlert {
+            FeedDebugLogger.log(.feed, "onPagerIndexChanged — clearing endOfFeedAlert")
             showEndOfFeedAlert = false
         }
         // Auto-advance is restarted by onPagerScrollSettled (always fires)
@@ -406,6 +476,7 @@ final class FeedViewModel {
 
     /// The user started dragging — stop all timers/animation cleanly.
     func onPagerDragBegan() {
+        FeedDebugLogger.log(.feed, "onPagerDragBegan — user started swiping, stopping timers")
         stopAutoAdvance()
     }
 
@@ -413,15 +484,26 @@ final class FeedViewModel {
     /// Always restarts auto-advance with a fresh 6-second window
     /// unless the end-of-feed alert is active or a refresh is in flight.
     func onPagerScrollSettled() {
-        guard feedState == .content, !items.isEmpty else { return }
-        guard !showEndOfFeedAlert else { return }
-        guard !isRefreshing else { return }
+        guard feedState == .content, !items.isEmpty else {
+            FeedDebugLogger.log(.feed, "onPagerScrollSettled — SKIPPED (state=\(feedState), items=\(items.count))")
+            return
+        }
+        guard !showEndOfFeedAlert else {
+            FeedDebugLogger.log(.feed, "onPagerScrollSettled — SKIPPED (endOfFeedAlert showing)")
+            return
+        }
+        guard !isRefreshing else {
+            FeedDebugLogger.log(.feed, "onPagerScrollSettled — SKIPPED (refreshing)")
+            return
+        }
+        FeedDebugLogger.log(.feed, "onPagerScrollSettled — restarting auto-advance at index \(currentIndex)")
         startAutoAdvance()
     }
 
     /// Called when user dismisses the "NO MORE LOCAL CONTENT" alert
     /// via close button or backdrop tap (no refresh).
     func dismissEndOfFeedAlert() {
+        FeedDebugLogger.log(.feed, "dismissEndOfFeedAlert — user dismissed without refresh")
         showEndOfFeedAlert = false
         // Don't restart auto-advance — user is on last item, nowhere to go.
         // They can swipe back or pull-to-refresh to find new content.
@@ -432,6 +514,7 @@ final class FeedViewModel {
     /// If content exists: shows it with auto-advance.
     /// If no content: shows the empty state.
     func refreshFeedFromAlert() {
+        FeedDebugLogger.log(.feed, "refreshFeedFromAlert — user tapped REFRESH on endOfFeed alert")
         showEndOfFeedAlert = false
         stopAutoAdvance()
         progress = 0.0
@@ -539,13 +622,16 @@ final class FeedViewModel {
 
     @MainActor
     private func switchToRealtimeMode() async {
-        guard let location = locationService.currentLocation else { return }
+        guard let location = locationService.currentLocation else {
+            FeedDebugLogger.log(.feed, "switchToRealtimeMode — no location, skipping")
+            return
+        }
 
         let cellId = S2CellCalculator.cellId(
             latitude: location.coordinate.latitude,
             longitude: location.coordinate.longitude
         )
-
+        FeedDebugLogger.log(.feed, "switchToRealtimeMode — subscribing to cell \(cellId)")
         await feedDataService.subscribeToCell(cellId: cellId)
     }
 

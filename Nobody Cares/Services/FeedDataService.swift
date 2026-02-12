@@ -33,6 +33,7 @@ final class FeedDataService {
         radius: Double = 10.0,
         offset: Int = 0
     ) async throws -> [ContentItem] {
+        FeedDebugLogger.log(.data, "fetchNearbyContent — lat=\(latitude) lng=\(longitude) r=\(radius)m offset=\(offset)")
         isLoading = true
         defer { isLoading = false }
 
@@ -52,14 +53,18 @@ final class FeedDataService {
             .execute()
             .value
 
+        FeedDebugLogger.log(.data, "fetchNearbyContent — RPC returned \(fetchedItems.count) items")
+
         // Generate signed URLs for each item
         fetchedItems = await generateSignedURLs(for: fetchedItems)
+        FeedDebugLogger.log(.data, "fetchNearbyContent — signed URLs generated for \(fetchedItems.count) items")
 
         return fetchedItems
     }
 
     /// Refresh the feed from scratch
     func refresh(latitude: Double, longitude: Double, radius: Double = 10.0) async {
+        FeedDebugLogger.log(.data, "refresh — START")
         do {
             let newItems = try await fetchNearbyContent(
                 latitude: latitude,
@@ -68,13 +73,16 @@ final class FeedDataService {
             )
             items = newItems
             error = nil
+            FeedDebugLogger.log(.data, "refresh — SUCCESS, \(newItems.count) items")
         } catch {
             self.error = "Failed to load nearby content"
+            FeedDebugLogger.log(.data, "refresh — FAILED: \(error)")
         }
     }
 
     /// Load the next page of content
     func loadMore(latitude: Double, longitude: Double, radius: Double = 10.0) async {
+        FeedDebugLogger.log(.data, "loadMore — offset=\(items.count)")
         do {
             let moreItems = try await fetchNearbyContent(
                 latitude: latitude,
@@ -82,8 +90,10 @@ final class FeedDataService {
                 radius: radius,
                 offset: items.count
             )
+            FeedDebugLogger.log(.data, "loadMore — got \(moreItems.count) more items (total: \(items.count + moreItems.count))")
             items.append(contentsOf: moreItems)
         } catch {
+            FeedDebugLogger.log(.data, "loadMore — FAILED: \(error)")
             // Silent failure for pagination
         }
     }
@@ -127,6 +137,7 @@ final class FeedDataService {
     /// Subscribe to new content in the given S2 cell (for stationary mode).
     /// When the user isn't moving, we listen for server-pushed updates instead of polling.
     func subscribeToCell(cellId: String) async {
+        FeedDebugLogger.log(.data, "subscribeToCell — \(cellId)")
         // Unsubscribe from previous cell
         await unsubscribeFromCell()
 
@@ -169,6 +180,7 @@ final class FeedDataService {
         // so it can re-fetch via the full get_nearby_content RPC.
         guard action.record["id"] != nil else { return }
 
+        FeedDebugLogger.log(.data, "⚡ Realtime INSERT detected — posting newNearbyContentAvailable")
         await MainActor.run {
             NotificationCenter.default.post(name: .newNearbyContentAvailable, object: nil)
         }
