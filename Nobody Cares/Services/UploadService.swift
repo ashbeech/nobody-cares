@@ -46,23 +46,35 @@ final class UploadService {
         print("[UploadService] Step 1/3 complete: contentId=\(uploadSlot.contentId)")
 
         // 2. Upload file to Storage via signed URL
-        print("[UploadService] Step 2/3: Uploading \(media.fileSizeBytes) bytes to Storage...")
+        print("[UploadService] Step 2/4: Uploading \(media.fileSizeBytes) bytes to Storage...")
         try await uploadToStorage(
             data: media.data,
             mimeType: media.mimeType,
             signedURL: uploadSlot.uploadURL,
             token: uploadSlot.uploadToken
         )
-        print("[UploadService] Step 2/3 complete: file uploaded")
+        print("[UploadService] Step 2/4 complete: file uploaded")
 
-        // 3. Confirm upload
-        print("[UploadService] Step 3/3: Confirming upload...")
+        // 3. Upload thumbnail (if available — videos only)
+        if let thumbnailData = media.thumbnailData {
+            print("[UploadService] Step 3/4: Uploading thumbnail (\(thumbnailData.count) bytes)...")
+            await uploadThumbnail(
+                data: thumbnailData,
+                contentId: uploadSlot.contentId
+            )
+            print("[UploadService] Step 3/4 complete: thumbnail uploaded")
+        } else {
+            print("[UploadService] Step 3/4: No thumbnail to upload (image content)")
+        }
+
+        // 4. Confirm upload
+        print("[UploadService] Step 4/4: Confirming upload...")
         try await confirmUpload(
             contentId: uploadSlot.contentId,
             storagePath: uploadSlot.storagePath,
             appAttest: appAttest
         )
-        print("[UploadService] Step 3/3 complete: upload confirmed")
+        print("[UploadService] Step 4/4 complete: upload confirmed")
     }
 
     // MARK: - Step 1: Request Upload Slot
@@ -149,7 +161,42 @@ final class UploadService {
         }
     }
 
-    // MARK: - Step 3: Confirm Upload
+    // MARK: - Step 3: Upload Thumbnail
+
+    /// Upload JPEG thumbnail to the `thumbnails` bucket and update the content
+    /// record with the thumbnail_path. Non-fatal — if this fails the feed still
+    /// works (just no instant thumbnail for this video).
+    private func uploadThumbnail(data: Data, contentId: String) async {
+        let thumbnailPath = "\(contentId).jpg"
+
+        do {
+            // Upload to thumbnails bucket
+            try await supabase.storage
+                .from("thumbnails")
+                .upload(
+                    thumbnailPath,
+                    data: data,
+                    options: .init(contentType: "image/jpeg", upsert: true)
+                )
+
+            // Update the content record with the thumbnail path
+            try await supabase
+                .from("content")
+                .update([
+                    "thumbnail_path": thumbnailPath,
+                    "thumbnail_generated_at": ISO8601DateFormatter().string(from: Date()),
+                ])
+                .eq("id", value: contentId)
+                .execute()
+
+            print("[UploadService] Thumbnail saved: \(thumbnailPath)")
+        } catch {
+            // Non-fatal: feed works without thumbnail, just shows placeholder
+            print("[UploadService] Thumbnail upload failed (non-fatal): \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Step 4: Confirm Upload
 
     private func confirmUpload(
         contentId: String,

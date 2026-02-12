@@ -7,12 +7,13 @@
 //  - 6-second auto-advance timer with progress bar
 //  - Press-and-hold pause
 //  - Mute state persistence within session
-//  - Content visibility hysteresis (enter 10m, exit 14m, 3s sticky)
-//  - Movement-triggered refresh and Realtime subscription for stationary mode
+//  - Realtime proximity awareness with smoothed location + hysteresis
+//  - Display updates (cheap, every location) vs server refresh (expensive, movement-triggered)
 //  - MediaPreloader integration for adjacent-item preloading
 //
 
 import SwiftUI
+import CoreLocation
 
 // MARK: - Feed State
 
@@ -38,12 +39,12 @@ enum FeedState: Equatable {
     }
 }
 
-// MARK: - Content Visibility (Hysteresis)
+// MARK: - Range State (Proximity Awareness)
 
-enum ContentVisibility: Equatable {
-    case visible      // within 10m
-    case exiting      // between 10m-14m, 3s countdown to hide
-    case hidden       // beyond 14m or countdown expired
+enum RangeState: Equatable {
+    case inRange      // distance ≤ enterRadius — playback allowed
+    case gracePeriod  // distance ≥ exitRadius, waiting exitHoldSeconds before removal
+    case outOfRange   // confirmed out — item will be removed from feed
 }
 
 // MARK: - Feed View Model
@@ -67,6 +68,9 @@ final class FeedViewModel {
     var isRefreshing: Bool = false
     var showEndOfFeedAlert: Bool = false
 
+    /// Per-item range states for proximity overlays. Published so the pager can observe.
+    var itemRangeStates: [UUID: RangeState] = [:]
+
     // MARK: - Services
 
     let locationService = LocationService()
@@ -78,20 +82,49 @@ final class FeedViewModel {
     private var autoAdvanceTimer: Timer?
     private var progressTimer: Timer?
     private var isLocationRefreshInFlight = false
-    private var hysteresisTimers: [UUID: Timer] = [:]
-    private var itemVisibility: [UUID: ContentVisibility] = [:]
+    private var exitTimers: [UUID: Task<Void, Never>] = [:]
+
+    /// Prevents duplicate initial refresh at startup
+    private var hasCompletedInitialRefresh = false
 
     /// Query radius ratchet: once content is found at a wider radius
     /// (due to momentarily poor accuracy), don't shrink the radius when
-    /// accuracy later improves — that would make visible items vanish.
-    /// Bounded by the 100 m cap in effectiveRadius.  Reset in startFeed().
+    /// accuracy later improves. Reset in startFeed().
     private var sessionMaxRadius: Double = 10.0
+
+    // MARK: - Location: UI vs Logic (separate positions)
+    //
+    // uiLocation (smoothed): weighted average of recent fixes, for radar dot / UI.
+    // logicLocation (conservative): only updated with high-quality fixes (accuracy ≤ 15m).
+    //   Used exclusively for range state transitions and server re-query decisions.
+    //   This separation prevents GPS jitter from flipping range states while still
+    //   keeping the UI dot smooth.
+
+    private var recentLocations: [CLLocation] = []
+    private let smoothingWindowSize = 5
+    private var smoothedLocation: CLLocation?    // for UI
+    private var logicLocation: CLLocation?       // for range checks — trusted fixes only
+
+    /// Per-item: how many consecutive location updates have computed distance
+    /// beyond the exit threshold. Requires 3+ (5 when stationary) before
+    /// transitioning to gracePeriod.
+    private var exitConfirmationCounts: [UUID: Int] = [:]
+
+    // MARK: - Constants
 
     private let autoAdvanceDuration: TimeInterval = 6.0
     private let progressInterval: TimeInterval = 1.0 / 60.0 // 60fps
-    private let enterRadius: Double = 10.0
-    private let exitRadius: Double = 14.0
-    private let stickyDelay: TimeInterval = 3.0
+
+    // Proximity thresholds — deliberately wide to absorb GPS jitter.
+    // Urban GPS accuracy is typically 5-15m; tight thresholds cause
+    // constant false "Leaving range" transitions from normal signal noise.
+    let enterRadiusMeters: Double = 12.0
+    let exitRadiusMeters: Double = 20.0   // 8m buffer above enter
+    let exitHoldSeconds: TimeInterval = 12.0  // must stay beyond exit for 12s before removal
+
+    /// Confirmations required before transitioning inRange → gracePeriod.
+    private let exitConfirmationsRequired = 3
+    private let exitConfirmationsRequiredStationary = 5
 
     // MARK: - Computed
 
@@ -104,8 +137,7 @@ final class FeedViewModel {
         !items.isEmpty
     }
 
-    /// Returns the effective query radius, ratcheted so it never shrinks
-    /// below the widest radius that previously returned content.
+    /// Returns the effective query radius, ratcheted so it never shrinks.
     private func queryRadius() -> Double {
         let effective = locationService.effectiveRadius
         sessionMaxRadius = max(sessionMaxRadius, effective)
@@ -118,8 +150,23 @@ final class FeedViewModel {
         FeedDebugLogger.log(.feed, "startFeed() called — setting state to .loading")
         feedState = .loading
         sessionMaxRadius = 10.0
+        hasCompletedInitialRefresh = false
+        recentLocations = []
+        smoothedLocation = nil
+        logicLocation = nil
+        itemRangeStates = [:]
+        exitConfirmationCounts = [:]
 
         // Set up location callbacks
+
+        // Display updates: fired on EVERY location update (cheap)
+        locationService.onLocationUpdate = { [weak self] location in
+            Task { @MainActor in
+                self?.handleDisplayUpdate(location)
+            }
+        }
+
+        // Server refresh: fired only on significant movement (expensive)
         locationService.onSignificantMovement = { [weak self] in
             Task { @MainActor in
                 FeedDebugLogger.log(.feed, "⚡ onSignificantMovement callback — triggering refreshFromLocation")
@@ -153,8 +200,14 @@ final class FeedViewModel {
         // Initial load with a brief delay for first location fix
         Task {
             FeedDebugLogger.log(.feed, "Waiting 1s for first GPS fix…")
-            // Wait briefly for first GPS fix
             try? await Task.sleep(for: .seconds(1))
+
+            // Fix double-refresh: skip if first location callback already triggered refresh
+            guard !hasCompletedInitialRefresh else {
+                FeedDebugLogger.log(.feed, "GPS wait complete — initial refresh already done, skipping")
+                return
+            }
+
             FeedDebugLogger.log(.feed, "GPS wait complete — calling refreshFromLocation")
             await refreshFromLocation()
         }
@@ -165,7 +218,248 @@ final class FeedViewModel {
         locationService.stopMonitoring()
         stopAutoAdvance()
         mediaPreloader.cancelAll()
+        cancelAllExitTimers()
         Task { await feedDataService.unsubscribeFromCell() }
+    }
+
+    // MARK: - Display Update (every location — cheap, local only)
+
+    @MainActor
+    private func handleDisplayUpdate(_ location: CLLocation) {
+        let accuracy = location.horizontalAccuracy
+
+        // Reject obviously bad fixes — don't drive any state from them
+        guard accuracy > 0, accuracy <= 50 else { return }
+
+        // Always update the smoothed location for UI (radar dot, etc.)
+        recentLocations.append(location)
+        if recentLocations.count > smoothingWindowSize {
+            recentLocations.removeFirst()
+        }
+        smoothedLocation = computeSmoothedLocation()
+
+        // Logic location: only update with high-quality fixes (accuracy ≤ 15m).
+        // This prevents GPS jitter from poisoning range state decisions.
+        if accuracy <= 15 {
+            logicLocation = location
+        }
+
+        // Range state transitions: only use the trusted logic location.
+        // If we haven't gotten a good fix yet, don't compute range states at all.
+        guard let logic = logicLocation else { return }
+
+        // Don't recompute from a stale logic location (> 30s old)
+        guard abs(logic.timestamp.timeIntervalSinceNow) < 30 else { return }
+
+        updateRangeStates(from: logic)
+    }
+
+    /// Compute weighted average of recent locations.
+    /// Weight each by 1 / max(1, horizontalAccuracy).
+    private func computeSmoothedLocation() -> CLLocation? {
+        guard !recentLocations.isEmpty else { return nil }
+
+        var totalWeight: Double = 0
+        var weightedLat: Double = 0
+        var weightedLng: Double = 0
+
+        for loc in recentLocations {
+            let weight = 1.0 / max(1.0, loc.horizontalAccuracy)
+            weightedLat += loc.coordinate.latitude * weight
+            weightedLng += loc.coordinate.longitude * weight
+            totalWeight += weight
+        }
+
+        guard totalWeight > 0 else { return recentLocations.last }
+
+        return CLLocation(
+            latitude: weightedLat / totalWeight,
+            longitude: weightedLng / totalWeight
+        )
+    }
+
+    /// Recompute range state for every item in the feed based on logic location (trusted fix).
+    @MainActor
+    private func updateRangeStates(from location: CLLocation) {
+        guard !items.isEmpty else { return }
+
+        var stateChanged = false
+        for item in items {
+            guard let capLat = item.captureLat, let capLng = item.captureLng else { continue }
+
+            let captureLocation = CLLocation(latitude: capLat, longitude: capLng)
+            let distance = location.distance(from: captureLocation)
+            let oldState = itemRangeStates[item.id] ?? .inRange
+
+            let newState = computeRangeTransition(
+                itemId: item.id,
+                distance: distance,
+                currentState: oldState
+            )
+
+            if newState != oldState {
+                itemRangeStates[item.id] = newState
+                stateChanged = true
+                FeedDebugLogger.log(.feed, "🎯 rangeState — \(item.id.uuidString.prefix(8))… dist=\(String(format: "%.1f", distance))m \(oldState)→\(newState)")
+            }
+        }
+
+        // If any state changed, the pager bridge will pick it up via observation
+        if stateChanged {
+            // Check if current item playback should change
+            if let current = currentItem {
+                let currentRange = itemRangeStates[current.id] ?? .inRange
+                FeedDebugLogger.log(.feed, "🎯 current item range=\(currentRange) (index=\(currentIndex))")
+            }
+        }
+    }
+
+    /// Whether the user is stationary based on CLLocation.speed.
+    private var isStationary: Bool {
+        guard let speed = locationService.currentLocation?.speed, speed >= 0 else { return false }
+        return speed < 0.5
+    }
+
+    /// State machine for a single item's range transition with hysteresis.
+    /// Requires multiple consecutive beyond-exit readings before starting the
+    /// grace period (3 normally, 5 when stationary). This prevents GPS jitter
+    /// from triggering false "Leaving range" transitions.
+    private func computeRangeTransition(
+        itemId: UUID,
+        distance: Double,
+        currentState: RangeState
+    ) -> RangeState {
+        let needed = isStationary ? exitConfirmationsRequiredStationary : exitConfirmationsRequired
+
+        switch currentState {
+        case .inRange:
+            if distance >= exitRadiusMeters {
+                // Increment confirmation counter
+                let count = (exitConfirmationCounts[itemId] ?? 0) + 1
+                exitConfirmationCounts[itemId] = count
+                if count >= needed {
+                    // Confirmed: start grace period (exit timer will remove if sustained)
+                    exitConfirmationCounts[itemId] = nil
+                    startExitTimer(for: itemId)
+                    return .gracePeriod
+                }
+                // Not yet confirmed — stay inRange, wait for more readings
+                return .inRange
+            }
+            // Back within range — reset confirmation counter
+            exitConfirmationCounts[itemId] = nil
+            return .inRange
+
+        case .gracePeriod:
+            if distance <= enterRadiusMeters {
+                // Came back within range — cancel exit
+                cancelExitTimer(for: itemId)
+                exitConfirmationCounts[itemId] = nil
+                return .inRange
+            }
+            // Stay in grace period — the exit timer will resolve it
+            return .gracePeriod
+
+        case .outOfRange:
+            // outOfRange items should have been removed from the feed.
+            // If we somehow still see one, let it re-enter on proximity.
+            if distance <= enterRadiusMeters {
+                cancelExitTimer(for: itemId)
+                exitConfirmationCounts[itemId] = nil
+                return .inRange
+            }
+            return .outOfRange
+        }
+    }
+
+    // MARK: - Exit Timers (hysteresis)
+
+    private func startExitTimer(for itemId: UUID) {
+        cancelExitTimer(for: itemId)
+        exitTimers[itemId] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(self?.exitHoldSeconds ?? 12.0))
+            guard !Task.isCancelled, let self else { return }
+
+            // Re-check distance with latest logic location (not smoothed — avoids drift)
+            guard let logic = self.logicLocation,
+                  let item = self.items.first(where: { $0.id == itemId }),
+                  let capLat = item.captureLat,
+                  let capLng = item.captureLng else {
+                return
+            }
+
+            let captureLocation = CLLocation(latitude: capLat, longitude: capLng)
+            let distance = logic.distance(from: captureLocation)
+
+            if distance >= self.exitRadiusMeters {
+                // Confirmed out — remove from feed entirely
+                FeedDebugLogger.log(.feed, "🗑 exitTimer — \(itemId.uuidString.prefix(8))… confirmed outOfRange (dist=\(String(format: "%.1f", distance))m) → removing from feed")
+                self.removeItemFromFeed(itemId)
+            } else {
+                // Came back — restore inRange
+                self.itemRangeStates[itemId] = .inRange
+                FeedDebugLogger.log(.feed, "🎯 exitTimer — \(itemId.uuidString.prefix(8))… back inRange (dist=\(String(format: "%.1f", distance))m)")
+            }
+
+            self.exitTimers[itemId] = nil
+        }
+    }
+
+    private func cancelExitTimer(for itemId: UUID) {
+        exitTimers[itemId]?.cancel()
+        exitTimers[itemId] = nil
+    }
+
+    private func cancelAllExitTimers() {
+        for (_, task) in exitTimers { task.cancel() }
+        exitTimers.removeAll()
+    }
+
+    // MARK: - Item Removal (outOfRange items leave the feed)
+
+    /// Remove an item from the feed entirely. Called when exit timer confirms
+    /// the item is truly out of range, or when a refresh excludes it.
+    @MainActor
+    private func removeItemFromFeed(_ itemId: UUID) {
+        guard let idx = items.firstIndex(where: { $0.id == itemId }) else { return }
+
+        FeedDebugLogger.log(.feed, "🗑 removing \(itemId.uuidString.prefix(8))… from feed (index \(idx), \(items.count) items → \(items.count - 1))")
+
+        // Clean up state tracking
+        itemRangeStates[itemId] = nil
+        exitConfirmationCounts[itemId] = nil
+        cancelExitTimer(for: itemId)
+
+        // Remove from items array
+        items.remove(at: idx)
+
+        if items.isEmpty {
+            currentIndex = 0
+            mediaPreloader.cancelAll()
+            stopAutoAdvance()
+            feedState = .empty
+            FeedDebugLogger.log(.feed, "🗑 feed is now empty after removal")
+            return
+        }
+
+        // Adjust currentIndex to keep user on the same content
+        if idx < currentIndex {
+            // Removed item was before current — shift index back
+            currentIndex = max(0, currentIndex - 1)
+        } else if idx == currentIndex {
+            // Removed the current item — stay at same index (now shows next item)
+            // or clamp to the last item if we were at the end
+            currentIndex = min(currentIndex, items.count - 1)
+        }
+        // else: removed item was after current, no index change needed
+
+        mediaPreloader.setItems(items)
+        mediaPreloader.updateBuffer(around: currentIndex)
+
+        // Restart auto-advance (may now advance past the removed gap)
+        if feedState == .content && !isPaused {
+            startAutoAdvance()
+        }
     }
 
     // MARK: - Content Fetching
@@ -173,16 +467,12 @@ final class FeedViewModel {
     @MainActor
     private func refreshFromLocation() async {
         // Don't refresh while the end-of-feed alert is showing.
-        // Background events (location, Realtime) must not mutate feed state
-        // underneath the alert — the user must act first.
         guard !showEndOfFeedAlert else {
             FeedDebugLogger.log(.feed, "refreshFromLocation — SKIPPED (endOfFeedAlert is showing)")
             return
         }
 
-        // Prevent concurrent location refreshes: movement callbacks and periodic
-        // timers can overlap, producing races where the last-to-finish overwrites
-        // a valid result with stale data.
+        // Prevent concurrent location refreshes
         guard !isLocationRefreshInFlight else {
             FeedDebugLogger.log(.feed, "refreshFromLocation — SKIPPED (refresh already in flight)")
             return
@@ -192,7 +482,6 @@ final class FeedViewModel {
 
         guard let location = locationService.currentLocation else {
             FeedDebugLogger.log(.feed, "refreshFromLocation — no currentLocation, attempting fetchCurrentLocation")
-            // Try to get a location
             let fetched = await locationService.fetchCurrentLocation()
             if fetched == nil {
                 FeedDebugLogger.log(.feed, "refreshFromLocation — fetchCurrentLocation FAILED, showing error")
@@ -219,65 +508,98 @@ final class FeedViewModel {
             if items.isEmpty {
                 feedState = .error("NO SIGNAL. CONTENT IS PATIENT. Check your connection and try again.")
             }
-            // If we already have content, silently ignore the error
         } else if feedDataService.items.isEmpty {
-            if !items.isEmpty {
-                // GPS jitter guard: we had content, but this refresh returned nothing.
-                // Indoor GPS can drift 10-65m, pushing us outside the small radius.
-                // Keep existing content instead of flashing the empty state.
-                FeedDebugLogger.log(.feed, "refreshFromLocation — EMPTY result but had \(items.count) items → KEEPING existing content (GPS jitter guard)")
+            // GPS jitter guard: only keep existing content if accuracy is very poor.
+            // With good accuracy, an empty result is genuine — show empty state.
+            let accuracy = location.horizontalAccuracy
+            if !items.isEmpty && accuracy > 50 {
+                FeedDebugLogger.log(.feed, "refreshFromLocation — EMPTY result but had \(items.count) items and poor accuracy (\(String(format: "%.0f", accuracy))m) → KEEPING existing content")
+            } else if !items.isEmpty {
+                FeedDebugLogger.log(.feed, "refreshFromLocation — EMPTY result (accuracy \(String(format: "%.0f", accuracy))m is OK), accepting empty")
+                items = []
+                mediaPreloader.cancelAll()
+                cancelAllExitTimers()
+                itemRangeStates.removeAll()
+                exitConfirmationCounts.removeAll()
+                feedState = .empty
             } else {
                 FeedDebugLogger.log(.feed, "refreshFromLocation — EMPTY result (first load), showing empty state")
                 feedState = .empty
             }
         } else {
             let hadContent = !items.isEmpty
-            let newItems = feedDataService.items
-            FeedDebugLogger.log(.feed, "refreshFromLocation — GOT \(newItems.count) items (had \(items.count))", detail: "hadContent=\(hadContent)")
-            for (i, item) in newItems.enumerated() {
-                FeedDebugLogger.log(.feed, "  [\(i)] \(item.contentType.rawValue) id=\(item.id.uuidString.prefix(8))… dist=\(String(format: "%.1f", item.distanceMeters))m @\(item.username)")
+            let allItems = feedDataService.items
+
+            // Filter: only include items within exit radius (server-reported distance).
+            // Items beyond this are not eligible for the feed — no point showing them
+            // just to immediately mark them "WALKED AWAY".
+            let eligible = allItems.filter { $0.distanceMeters <= exitRadiusMeters }
+
+            FeedDebugLogger.log(.feed, "refreshFromLocation — GOT \(allItems.count) items, \(eligible.count) eligible (had \(items.count))", detail: "hadContent=\(hadContent)")
+            for (i, item) in allItems.enumerated() {
+                let inFeed = eligible.contains(where: { $0.id == item.id })
+                FeedDebugLogger.log(.feed, "  [\(i)] \(item.contentType.rawValue) id=\(item.id.uuidString.prefix(8))… dist=\(String(format: "%.1f", item.distanceMeters))m @\(item.username)\(inFeed ? "" : " [EXCLUDED]")")
             }
 
-            // GPS jitter guard (extended): when we already have content and the
-            // new result only *removed* items (no new IDs appeared), keep existing
-            // content.  GPS noise can temporarily push the query point away from
-            // nearby content, making items drop out of the small radius.
-            // Content removal should only happen via user-initiated actions
-            // (pull-to-refresh, refresh-from-alert).
-            if hadContent && newItems.count < items.count {
-                let existingIds = Set(items.map(\.id))
-                let newIds = Set(newItems.map(\.id))
-                let addedIds = newIds.subtracting(existingIds)
-
-                if addedIds.isEmpty {
-                    FeedDebugLogger.log(.feed, "refreshFromLocation — result shrank \(items.count)→\(newItems.count) with no new items → KEEPING existing content (GPS jitter guard)")
-                    return
+            if eligible.isEmpty {
+                // All server items are beyond exit radius
+                if hadContent {
+                    FeedDebugLogger.log(.feed, "refreshFromLocation — no eligible items, clearing feed")
+                    items = []
+                    mediaPreloader.cancelAll()
+                    cancelAllExitTimers()
+                    itemRangeStates.removeAll()
+                    exitConfirmationCounts.removeAll()
+                    feedState = .empty
+                } else {
+                    feedState = .empty
                 }
-            }
-
-            mediaPreloader.setItems(newItems)
-            items = newItems
-
-            // Clear end-of-feed alert if new content appeared
-            if showEndOfFeedAlert { showEndOfFeedAlert = false }
-
-            if hadContent {
-                // Smart: preserve current index if in bounds
-                if currentIndex >= items.count {
-                    let oldIdx = currentIndex
-                    currentIndex = max(0, items.count - 1)
-                    FeedDebugLogger.log(.feed, "refreshFromLocation — clamped currentIndex \(oldIdx)→\(currentIndex)")
-                }
-                mediaPreloader.updateBuffer(around: currentIndex)
             } else {
-                currentIndex = 0
-                progress = 0.0
-                feedState = .content
-                FeedDebugLogger.log(.feed, "refreshFromLocation — first load, starting auto-advance from index 0")
-                mediaPreloader.updateBuffer(around: 0)
-                startAutoAdvance()
+                // Replace feed with eligible items only — all start as inRange
+                mediaPreloader.setItems(eligible)
+                items = eligible
+                initializeRangeStates(for: eligible)
+
+                if showEndOfFeedAlert { showEndOfFeedAlert = false }
+
+                if hadContent {
+                    if currentIndex >= items.count {
+                        let oldIdx = currentIndex
+                        currentIndex = max(0, items.count - 1)
+                        FeedDebugLogger.log(.feed, "refreshFromLocation — clamped currentIndex \(oldIdx)→\(currentIndex)")
+                    }
+                    mediaPreloader.updateBuffer(around: currentIndex)
+                } else {
+                    currentIndex = 0
+                    progress = 0.0
+                    feedState = .content
+                    FeedDebugLogger.log(.feed, "refreshFromLocation — first load, starting auto-advance from index 0")
+                    mediaPreloader.updateBuffer(around: 0)
+                    startAutoAdvance()
+                }
             }
         }
+
+        // Mark initial refresh as completed (prevents double-refresh at startup)
+        hasCompletedInitialRefresh = true
+    }
+
+    /// Initialize range states for newly fetched items.
+    /// All items in the feed are pre-filtered to within exit radius, so they
+    /// all start as inRange. Previous states are NOT preserved — a server refresh
+    /// is a "truth reset". This prevents stale outOfRange/gracePeriod states from
+    /// persisting after the server confirms an item is still nearby.
+    private func initializeRangeStates(for newItems: [ContentItem]) {
+        // Cancel all in-flight exit timers from the previous state
+        cancelAllExitTimers()
+        exitConfirmationCounts.removeAll()
+
+        // All items start fresh as inRange
+        var newStates: [UUID: RangeState] = [:]
+        for item in newItems {
+            newStates[item.id] = .inRange
+        }
+        itemRangeStates = newStates
     }
 
     // MARK: - Smart Refresh (pull-to-refresh: don't reload identical content, never flash)
@@ -310,42 +632,47 @@ final class FeedViewModel {
             FeedDebugLogger.log(.feed, "smartRefresh — fetching at lat=\(location.coordinate.latitude) lng=\(location.coordinate.longitude) r=\(radius)m")
 
             do {
-                let newItems = try await feedDataService.fetchNearbyContent(
+                let allItems = try await feedDataService.fetchNearbyContent(
                     latitude: location.coordinate.latitude,
                     longitude: location.coordinate.longitude,
                     radius: radius
                 )
 
+                // Filter to eligible items (within exit radius by server-reported distance)
+                let eligible = allItems.filter { $0.distanceMeters <= exitRadiusMeters }
                 let existingIds = items.map(\.id)
-                let newIds = newItems.map(\.id)
+                let eligibleIds = eligible.map(\.id)
 
-                if existingIds == newIds {
-                    FeedDebugLogger.log(.feed, "smartRefresh — SAME \(newItems.count) items (URLs refreshed silently)")
-                    // Same items — silently update signed URLs without any visual change
-                    mediaPreloader.setItems(newItems)
-                    items = newItems
-                    // Don't clear end-of-feed alert — content is identical
-                } else if newItems.isEmpty {
-                    FeedDebugLogger.log(.feed, "smartRefresh — EMPTY result (was \(items.count))")
+                if eligible.isEmpty {
+                    FeedDebugLogger.log(.feed, "smartRefresh — EMPTY (all \(allItems.count) items beyond exit radius)")
                     items = []
                     mediaPreloader.cancelAll()
+                    cancelAllExitTimers()
+                    itemRangeStates.removeAll()
+                    exitConfirmationCounts.removeAll()
                     feedState = .empty
+                } else if existingIds == eligibleIds {
+                    FeedDebugLogger.log(.feed, "smartRefresh — SAME \(eligible.count) eligible items (URLs + range states refreshed)")
+                    mediaPreloader.setItems(eligible)
+                    items = eligible
+                    // Reset range states even for same items — server confirmed they're nearby
+                    initializeRangeStates(for: eligible)
                 } else {
-                    FeedDebugLogger.log(.feed, "smartRefresh — DIFFERENT content: \(items.count)→\(newItems.count) items")
-                    for (i, item) in newItems.enumerated() {
+                    FeedDebugLogger.log(.feed, "smartRefresh — DIFFERENT content: \(items.count)→\(eligible.count) eligible (of \(allItems.count) total)")
+                    for (i, item) in eligible.enumerated() {
                         FeedDebugLogger.log(.feed, "  [\(i)] \(item.contentType.rawValue) id=\(item.id.uuidString.prefix(8))… dist=\(String(format: "%.1f", item.distanceMeters))m")
                     }
 
-                    // Different content — update in-place
                     if showEndOfFeedAlert { showEndOfFeedAlert = false }
                     let currentItemId = currentIndex < items.count ? items[currentIndex].id : nil
 
-                    mediaPreloader.setItems(newItems)
-                    items = newItems
+                    mediaPreloader.setItems(eligible)
+                    items = eligible
+                    initializeRangeStates(for: eligible)
 
                     // Try to keep the user on the same item
                     if let cid = currentItemId,
-                       let newIdx = newItems.firstIndex(where: { $0.id == cid }) {
+                       let newIdx = eligible.firstIndex(where: { $0.id == cid }) {
                         FeedDebugLogger.log(.feed, "smartRefresh — preserved position at index \(newIdx)")
                         currentIndex = newIdx
                     } else {
@@ -361,11 +688,10 @@ final class FeedViewModel {
                     mediaPreloader.updateBuffer(around: currentIndex)
                 }
 
-                feedDataService.items = newItems
+                feedDataService.items = eligible
                 feedDataService.error = nil
             } catch {
                 FeedDebugLogger.log(.feed, "smartRefresh — NETWORK ERROR: \(error.localizedDescription)")
-                // Don't overwrite existing content on error
                 if items.isEmpty {
                     feedState = .error("NO SIGNAL. CONTENT IS PATIENT. Check your connection and try again.")
                 }
@@ -376,9 +702,6 @@ final class FeedViewModel {
     // MARK: - Auto-Advance Timer
 
     func startAutoAdvance() {
-        // Never start a timer when there's no content to advance through.
-        // This prevents the timer from firing on the empty/error view and
-        // accidentally triggering showEndOfFeedAlert.
         guard feedState == .content, !items.isEmpty else {
             FeedDebugLogger.log(.feed, "startAutoAdvance — SKIPPED (state=\(feedState), items=\(items.count))")
             return
@@ -388,13 +711,37 @@ final class FeedViewModel {
         progress = 0.0
         FeedDebugLogger.log(.feed, "⏱ startAutoAdvance — 6s timer started at index \(currentIndex)/\(items.count - 1)")
 
-        // Progress update at ~60fps
         progressTimer = Timer.scheduledTimer(withTimeInterval: progressInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, !self.isPaused else { return }
                 self.progress += self.progressInterval / self.autoAdvanceDuration
                 if self.progress >= 1.0 {
-                    self.advanceToNext()
+                    self.progress = 1.0
+                    // Stop the 60fps progress timer — it's done its job.
+                    // Either advance succeeds (and startAutoAdvance restarts for next item),
+                    // or it's blocked and we retry at 0.5s instead of 60fps.
+                    self.progressTimer?.invalidate()
+                    self.progressTimer = nil
+                    self.attemptAutoAdvance()
+                }
+            }
+        }
+    }
+
+    /// Attempt to advance. If blocked, retry every 0.5s (not 60fps).
+    private func attemptAutoAdvance() {
+        autoAdvanceTimer?.invalidate()
+        autoAdvanceTimer = nil
+
+        if !advanceToNext() {
+            // Blocked — retry periodically
+            autoAdvanceTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, !self.isPaused else { return }
+                    if self.advanceToNext() {
+                        self.autoAdvanceTimer?.invalidate()
+                        self.autoAdvanceTimer = nil
+                    }
                 }
             }
         }
@@ -412,12 +759,13 @@ final class FeedViewModel {
 
     // MARK: - Navigation
 
-    func advanceToNext() {
-        // Never auto-advance on an empty feed — nothing to advance to.
+    /// Advance to the next eligible (inRange + ready) item.
+    /// Returns true if advance succeeded, false if blocked.
+    @discardableResult
+    func advanceToNext() -> Bool {
         guard !items.isEmpty else {
-            FeedDebugLogger.log(.feed, "advanceToNext — SKIPPED (empty feed)")
             stopAutoAdvance()
-            return
+            return false
         }
 
         // Track view of current item before advancing
@@ -428,31 +776,36 @@ final class FeedViewModel {
             ])
         }
 
-        guard currentIndex < items.count - 1 else {
-            // At last item — stop timer permanently, show end-of-feed alert.
-            // Content keeps looping in background; no navigation or restart.
-            FeedDebugLogger.log(.feed, "▶ advanceToNext — REACHED END at index \(currentIndex)/\(items.count - 1), showing endOfFeedAlert")
+        // Find next eligible item — skip gracePeriod items (they're about to be removed).
+        // outOfRange items have already been removed from the feed.
+        var nextIndex = currentIndex + 1
+        while nextIndex < items.count {
+            let nextId = items[nextIndex].id
+            let nextRange = itemRangeStates[nextId] ?? .inRange
+            if nextRange == .inRange { break }
+            nextIndex += 1
+        }
+
+        guard nextIndex < items.count else {
+            FeedDebugLogger.log(.feed, "▶ advanceToNext — END at index \(currentIndex)/\(items.count - 1)")
             stopAutoAdvance()
             progress = 0.0
             showEndOfFeedAlert = true
-            return
+            return false
         }
 
-        // Readiness gate for auto-advance only: don't advance onto an unprepared item.
-        // The timer keeps firing so this retries every frame until ready.
-        guard mediaPreloader.isReady(currentIndex + 1) else {
-            // Only log once per second to avoid spam (progress is near 1.0)
-            return
+        // Readiness gate: don't advance onto an unprepared item.
+        guard mediaPreloader.isReady(nextIndex) else {
+            // Not ready — will retry (caller handles retry timer)
+            return false
         }
 
-        FeedDebugLogger.log(.feed, "▶ advanceToNext — \(currentIndex)→\(currentIndex + 1) of \(items.count)")
+        FeedDebugLogger.log(.feed, "▶ advanceToNext — \(currentIndex)→\(nextIndex) of \(items.count)")
 
-        // Stop the timer now. It will be restarted by onPagerScrollSettled
-        // once the scroll animation completes — giving a clean 6-second window.
         stopAutoAdvance()
-
-        currentIndex += 1
+        currentIndex = nextIndex
         progress = 0.0
+        return true
     }
 
     func goToPrevious() {
@@ -465,7 +818,6 @@ final class FeedViewModel {
     func refresh() {
         FeedDebugLogger.log(.feed, "refresh() called — items=\(items.count)")
         if items.isEmpty {
-            // No existing content — show loading
             feedState = .loading
         }
         currentIndex = 0
@@ -503,30 +855,23 @@ final class FeedViewModel {
 
     // MARK: - Pager Callbacks (called from FeedPagerViewController via bridge)
 
-    /// The pager's scroll settled on a new index.
     func onPagerIndexChanged(_ index: Int) {
         guard index != currentIndex else { return }
         FeedDebugLogger.log(.feed, "onPagerIndexChanged — \(currentIndex)→\(index)")
         currentIndex = index
         progress = 0.0
 
-        // User navigated away from last item — clear end-of-feed alert
         if showEndOfFeedAlert {
             FeedDebugLogger.log(.feed, "onPagerIndexChanged — clearing endOfFeedAlert")
             showEndOfFeedAlert = false
         }
-        // Auto-advance is restarted by onPagerScrollSettled (always fires)
     }
 
-    /// The user started dragging — stop all timers/animation cleanly.
     func onPagerDragBegan() {
         FeedDebugLogger.log(.feed, "onPagerDragBegan — user started swiping, stopping timers")
         stopAutoAdvance()
     }
 
-    /// The pager's scroll finished (fired regardless of whether index changed).
-    /// Always restarts auto-advance with a fresh 6-second window
-    /// unless the end-of-feed alert is active or a refresh is in flight.
     func onPagerScrollSettled() {
         guard feedState == .content, !items.isEmpty else {
             FeedDebugLogger.log(.feed, "onPagerScrollSettled — SKIPPED (state=\(feedState), items=\(items.count))")
@@ -544,46 +889,29 @@ final class FeedViewModel {
         startAutoAdvance()
     }
 
-    /// Called when user dismisses the "NO MORE LOCAL CONTENT" alert
-    /// via close button or backdrop tap (no refresh).
     func dismissEndOfFeedAlert() {
         FeedDebugLogger.log(.feed, "dismissEndOfFeedAlert — user dismissed without refresh")
         showEndOfFeedAlert = false
-        // Don't restart auto-advance — user is on last item, nowhere to go.
-        // They can swipe back or pull-to-refresh to find new content.
     }
 
-    /// Called when user taps REFRESH on the end-of-feed alert.
-    /// Dismisses the alert, resets to index 0, fetches fresh content.
-    /// If content exists: shows it with auto-advance.
-    /// If no content: shows the empty state.
     func refreshFeedFromAlert() {
         FeedDebugLogger.log(.feed, "refreshFeedFromAlert — user tapped REFRESH on endOfFeed alert")
         showEndOfFeedAlert = false
         stopAutoAdvance()
         progress = 0.0
 
-        // Mark refreshing *before* changing currentIndex so that
-        // onPagerScrollSettled (fired when the scroll animation lands)
-        // won't restart the auto-advance timer mid-refresh.
         isRefreshing = true
-
-        // Reset to first page. This triggers a programmatic scroll via
-        // updateUIViewController → scrollToIndex(0). The scroll's
-        // onScrollSettled is gated by isRefreshing above.
         currentIndex = 0
 
         Task { @MainActor in
             defer { isRefreshing = false }
 
-            // Resolve location: prefer cached, fall back to a fresh fix
             var location = locationService.currentLocation
             if location == nil {
                 location = await locationService.fetchCurrentLocation()
             }
 
             guard let location else {
-                // No location at all. Keep existing content if we have it.
                 if !items.isEmpty {
                     feedState = .content
                     startAutoAdvance()
@@ -598,50 +926,53 @@ final class FeedViewModel {
         }
     }
 
-    /// Shared fetch logic for refreshFeedFromAlert.
-    /// Uses fetchNearbyContent directly (not feedDataService.refresh)
-    /// so we can preserve existing content on network errors.
     @MainActor
     private func performRefreshFetch(latitude: Double, longitude: Double) async {
         let radius = queryRadius()
 
         do {
-            let newItems = try await feedDataService.fetchNearbyContent(
+            let allItems = try await feedDataService.fetchNearbyContent(
                 latitude: latitude,
                 longitude: longitude,
                 radius: radius
             )
 
-            if newItems.isEmpty {
-                // When GPS accuracy is poor, an empty result usually means the
-                // query position drifted far from the user's real location.
-                // Don't nuke existing content — restart auto-advance instead.
+            // Filter to eligible items
+            let eligible = allItems.filter { $0.distanceMeters <= exitRadiusMeters }
+
+            if eligible.isEmpty {
+                // User explicitly triggered this refresh — accept the empty result
+                // unless accuracy is extremely poor (>50m)
                 let accuracy = locationService.currentLocation?.horizontalAccuracy ?? 0
-                if !items.isEmpty && accuracy > 15 {
-                    FeedDebugLogger.log(.feed, "performRefreshFetch — EMPTY result with poor accuracy (\(String(format: "%.0f", accuracy))m), keeping existing \(items.count) items")
+                if !items.isEmpty && accuracy > 50 {
+                    FeedDebugLogger.log(.feed, "performRefreshFetch — no eligible items with poor accuracy (\(String(format: "%.0f", accuracy))m), keeping existing \(items.count) items")
                     currentIndex = 0
                     feedState = .content
                     mediaPreloader.updateBuffer(around: 0)
                     startAutoAdvance()
                 } else {
+                    FeedDebugLogger.log(.feed, "performRefreshFetch — no eligible items, clearing feed")
                     items = []
                     mediaPreloader.cancelAll()
+                    cancelAllExitTimers()
+                    itemRangeStates.removeAll()
+                    exitConfirmationCounts.removeAll()
                     feedState = .empty
                 }
             } else {
-                mediaPreloader.setItems(newItems)
-                items = newItems
+                FeedDebugLogger.log(.feed, "performRefreshFetch — \(eligible.count) eligible items (of \(allItems.count) total)")
+                mediaPreloader.setItems(eligible)
+                items = eligible
+                initializeRangeStates(for: eligible)
                 currentIndex = 0
                 feedState = .content
                 mediaPreloader.updateBuffer(around: 0)
                 startAutoAdvance()
 
-                // Keep feedDataService in sync
-                feedDataService.items = newItems
+                feedDataService.items = eligible
                 feedDataService.error = nil
             }
         } catch {
-            // Network error — preserve existing content if we have it
             if !items.isEmpty {
                 currentIndex = 0
                 feedState = .content
@@ -664,11 +995,12 @@ final class FeedViewModel {
             radius: queryRadius()
         )
         if feedDataService.items.count > items.count {
-            let newItems = feedDataService.items
-            mediaPreloader.setItems(newItems)
-            items = newItems
+            let eligible = feedDataService.items.filter { $0.distanceMeters <= exitRadiusMeters }
+            guard eligible.count > items.count else { return }
+            mediaPreloader.setItems(eligible)
+            items = eligible
+            initializeRangeStates(for: eligible)
             mediaPreloader.updateBuffer(around: currentIndex)
-            // New content arrived — clear alert and resume auto-advance
             if showEndOfFeedAlert { showEndOfFeedAlert = false }
             startAutoAdvance()
         }
@@ -689,60 +1021,5 @@ final class FeedViewModel {
         )
         FeedDebugLogger.log(.feed, "switchToRealtimeMode — subscribing to cell \(cellId)")
         await feedDataService.subscribeToCell(cellId: cellId)
-    }
-
-    // MARK: - Content Visibility Hysteresis
-
-    /// Update visibility for an item based on current distance.
-    /// Enter at 10m, exit at 14m with 3s sticky delay.
-    func updateVisibility(for item: ContentItem, currentDistance: Double) -> ContentVisibility {
-        let currentVisibility = itemVisibility[item.id] ?? .hidden
-
-        switch currentVisibility {
-        case .hidden:
-            if currentDistance <= enterRadius {
-                itemVisibility[item.id] = .visible
-                return .visible
-            }
-            return .hidden
-
-        case .visible:
-            if currentDistance > exitRadius {
-                // Start exiting countdown
-                itemVisibility[item.id] = .exiting
-                startExitTimer(for: item.id)
-                return .exiting
-            }
-            return .visible
-
-        case .exiting:
-            if currentDistance <= enterRadius {
-                // Came back within range — cancel exit
-                cancelExitTimer(for: item.id)
-                itemVisibility[item.id] = .visible
-                return .visible
-            }
-            // Still in exit countdown
-            return .exiting
-        }
-    }
-
-    private func startExitTimer(for itemId: UUID) {
-        hysteresisTimers[itemId]?.invalidate()
-        hysteresisTimers[itemId] = Timer.scheduledTimer(withTimeInterval: stickyDelay, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                self?.itemVisibility[itemId] = .hidden
-                self?.hysteresisTimers[itemId] = nil
-                // If the now-hidden item is the current one, advance
-                if self?.currentItem?.id == itemId {
-                    self?.advanceToNext()
-                }
-            }
-        }
-    }
-
-    private func cancelExitTimer(for itemId: UUID) {
-        hysteresisTimers[itemId]?.invalidate()
-        hysteresisTimers[itemId] = nil
     }
 }

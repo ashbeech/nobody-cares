@@ -3,9 +3,11 @@
 //  Nobody Cares
 //
 //  Full-screen UICollectionViewCell for the vertical feed pager.
-//  Bottom layer: UIImageView (poster / preloaded image).
+//  Bottom layer: UIImageView (thumbnail / placeholder — always non-nil).
 //  Middle layer: PlayerContainerView (AVPlayerLayer for video).
 //  Top layer: UIHostingController with the SwiftUI ContentOverlayView.
+//
+//  v2: Loading overlay, out-of-range overlay, never-black guarantee.
 //
 
 import AVKit
@@ -22,7 +24,7 @@ final class FeedContentCell: UICollectionViewCell {
         let iv = UIImageView()
         iv.contentMode = .scaleAspectFill
         iv.clipsToBounds = true
-        iv.backgroundColor = .black
+        iv.backgroundColor = UIColor(white: 0.12, alpha: 1.0) // dark gray, not black
         return iv
     }()
 
@@ -30,6 +32,71 @@ final class FeedContentCell: UICollectionViewCell {
         let pv = PlayerContainerView()
         pv.backgroundColor = .clear  // transparent so poster shows through until video renders
         return pv
+    }()
+
+    // MARK: - Loading Overlay
+
+    private let loadingContainer: UIView = {
+        let v = UIView()
+        v.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+        v.isHidden = true
+        return v
+    }()
+
+    private let loadingSpinner: UIActivityIndicatorView = {
+        let s = UIActivityIndicatorView(style: .large)
+        s.color = .white
+        s.hidesWhenStopped = true
+        return s
+    }()
+
+    private let loadingLabel: UILabel = {
+        let l = UILabel()
+        l.text = "LOADING…"
+        l.textColor = .white
+        l.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        l.textAlignment = .center
+        return l
+    }()
+
+    // MARK: - Out-of-Range Overlay
+
+    private let outOfRangeContainer: UIView = {
+        let v = UIView()
+        v.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        v.isHidden = true
+        return v
+    }()
+
+    private let walkedAwayLabel: UILabel = {
+        let l = UILabel()
+        l.text = "WALKED AWAY"
+        l.textColor = .white
+        l.font = UIFont.monospacedSystemFont(ofSize: 18, weight: .bold)
+        l.textAlignment = .center
+        return l
+    }()
+
+    private let moveCloserLabel: UILabel = {
+        let l = UILabel()
+        l.text = "Move closer to watch"
+        l.textColor = UIColor.white.withAlphaComponent(0.7)
+        l.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        l.textAlignment = .center
+        return l
+    }()
+
+    // MARK: - Grace Period Overlay
+
+    private let gracePeriodLabel: UILabel = {
+        let l = UILabel()
+        l.text = "Leaving range…"
+        l.textColor = UIColor.white.withAlphaComponent(0.6)
+        l.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        l.textAlignment = .center
+        l.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+        l.isHidden = true
+        return l
     }()
 
     // MARK: - SwiftUI Overlay Host
@@ -46,25 +113,67 @@ final class FeedContentCell: UICollectionViewCell {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     private func setupViews() {
-        backgroundColor = .black
-        contentView.backgroundColor = .black
+        backgroundColor = UIColor(white: 0.12, alpha: 1.0) // dark gray, not black
+        contentView.backgroundColor = UIColor(white: 0.12, alpha: 1.0)
 
         imageView.translatesAutoresizingMaskIntoConstraints = false
         playerView.translatesAutoresizingMaskIntoConstraints = false
+        loadingContainer.translatesAutoresizingMaskIntoConstraints = false
+        loadingSpinner.translatesAutoresizingMaskIntoConstraints = false
+        loadingLabel.translatesAutoresizingMaskIntoConstraints = false
+        outOfRangeContainer.translatesAutoresizingMaskIntoConstraints = false
+        walkedAwayLabel.translatesAutoresizingMaskIntoConstraints = false
+        moveCloserLabel.translatesAutoresizingMaskIntoConstraints = false
+        gracePeriodLabel.translatesAutoresizingMaskIntoConstraints = false
 
         contentView.addSubview(imageView)
         contentView.addSubview(playerView)
+        contentView.addSubview(loadingContainer)
+        loadingContainer.addSubview(loadingSpinner)
+        loadingContainer.addSubview(loadingLabel)
+        contentView.addSubview(outOfRangeContainer)
+        outOfRangeContainer.addSubview(walkedAwayLabel)
+        outOfRangeContainer.addSubview(moveCloserLabel)
+        contentView.addSubview(gracePeriodLabel)
 
         NSLayoutConstraint.activate([
+            // Image layer (full screen)
             imageView.topAnchor.constraint(equalTo: contentView.topAnchor),
             imageView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
             imageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             imageView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
 
+            // Player layer (full screen)
             playerView.topAnchor.constraint(equalTo: contentView.topAnchor),
             playerView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
             playerView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             playerView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+
+            // Loading overlay (full screen)
+            loadingContainer.topAnchor.constraint(equalTo: contentView.topAnchor),
+            loadingContainer.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            loadingContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            loadingContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            loadingSpinner.centerXAnchor.constraint(equalTo: loadingContainer.centerXAnchor),
+            loadingSpinner.centerYAnchor.constraint(equalTo: loadingContainer.centerYAnchor, constant: -12),
+            loadingLabel.topAnchor.constraint(equalTo: loadingSpinner.bottomAnchor, constant: 8),
+            loadingLabel.centerXAnchor.constraint(equalTo: loadingContainer.centerXAnchor),
+
+            // Out-of-range overlay (full screen)
+            outOfRangeContainer.topAnchor.constraint(equalTo: contentView.topAnchor),
+            outOfRangeContainer.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            outOfRangeContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            outOfRangeContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            walkedAwayLabel.centerXAnchor.constraint(equalTo: outOfRangeContainer.centerXAnchor),
+            walkedAwayLabel.centerYAnchor.constraint(equalTo: outOfRangeContainer.centerYAnchor, constant: -12),
+            moveCloserLabel.topAnchor.constraint(equalTo: walkedAwayLabel.bottomAnchor, constant: 8),
+            moveCloserLabel.centerXAnchor.constraint(equalTo: outOfRangeContainer.centerXAnchor),
+
+            // Grace period label (bottom center, above HUD)
+            gracePeriodLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -80),
+            gracePeriodLabel.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+            gracePeriodLabel.widthAnchor.constraint(equalToConstant: 140),
+            gracePeriodLabel.heightAnchor.constraint(equalToConstant: 28),
         ])
     }
 
@@ -75,18 +184,39 @@ final class FeedContentCell: UICollectionViewCell {
         player: AVPlayer?,
         preloadedImage: UIImage?,
         isMuted: Bool,
-        isPlaying: Bool
+        isPlaying: Bool,
+        isReady: Bool,
+        rangeState: RangeState
     ) {
-        // Always show the preloaded image as a base / poster
-        imageView.image = preloadedImage
+        // Always set a non-nil image — thumbnail, cached, or placeholder
+        imageView.image = preloadedImage ?? MediaPreloader.placeholder
 
+        // Update loading overlay
+        let showLoading = !isReady && contentType == .video && rangeState != .outOfRange
+        loadingContainer.isHidden = !showLoading
+        if showLoading {
+            loadingSpinner.startAnimating()
+        } else {
+            loadingSpinner.stopAnimating()
+        }
+
+        // Update out-of-range overlay
+        outOfRangeContainer.isHidden = rangeState != .outOfRange
+        gracePeriodLabel.isHidden = rangeState != .gracePeriod
+
+        // Video player
         switch contentType {
         case .video:
-            if let player {
+            if rangeState == .outOfRange {
+                // Out of range — no playback, keep thumbnail visible
+                playerView.player?.pause()
+                playerView.player = nil
+                playerView.isHidden = true
+            } else if let player {
                 playerView.player = player
                 playerView.isHidden = false
                 player.isMuted = isMuted
-                if isPlaying {
+                if isPlaying && isReady {
                     player.play()
                 } else {
                     player.pause()
@@ -134,7 +264,12 @@ final class FeedContentCell: UICollectionViewCell {
         playerView.player?.pause()
         playerView.player = nil
         playerView.isHidden = true
-        imageView.image = nil
+        imageView.image = MediaPreloader.placeholder
+
+        loadingContainer.isHidden = true
+        loadingSpinner.stopAnimating()
+        outOfRangeContainer.isHidden = true
+        gracePeriodLabel.isHidden = true
 
         overlayHost?.willMove(toParent: nil)
         overlayHost?.view.removeFromSuperview()

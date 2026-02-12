@@ -21,6 +21,7 @@ struct ContentItem: Identifiable, Codable {
     let contentType: ContentType
     let durationMs: Int?
     let mediaPath: String        // Storage object key (e.g. "originals/2026/02/11/uuid.heif")
+    let thumbnailPath: String?   // Thumbnail storage key (e.g. "uuid.jpg") — nil for old content
     let distanceMeters: Double
     let captureLat: Double?      // Latitude where content was captured (for dev radar)
     let captureLng: Double?      // Longitude where content was captured (for dev radar)
@@ -28,6 +29,8 @@ struct ContentItem: Identifiable, Codable {
 
     /// Signed URL generated client-side from mediaPath — not persisted
     var signedURL: URL?
+    /// Signed URL for the thumbnail image — not persisted
+    var thumbnailURL: URL?
 
     enum CodingKeys: String, CodingKey {
         case id = "content_id"
@@ -36,6 +39,7 @@ struct ContentItem: Identifiable, Codable {
         case contentType = "content_type"
         case durationMs = "duration_ms"
         case mediaPath = "media_path"
+        case thumbnailPath = "thumbnail_path"
         case distanceMeters = "distance_meters"
         case captureLat = "capture_lat"
         case captureLng = "capture_lng"

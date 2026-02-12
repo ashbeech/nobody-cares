@@ -24,6 +24,8 @@ struct ProcessedMedia {
     let fileExtension: String
     let mimeType: String
     let durationMs: Int?
+    /// JPEG thumbnail extracted from the local video file (nil for images)
+    let thumbnailData: Data?
 
     var fileSizeBytes: Int { data.count }
 }
@@ -60,13 +62,14 @@ enum MediaProcessor {
             contentType: .image,
             fileExtension: fileExtension,
             mimeType: mimeType,
-            durationMs: nil
+            durationMs: nil,
+            thumbnailData: nil
         )
     }
 
     // MARK: - Video Processing
 
-    /// Process a captured video: validate duration, export at 1080p.
+    /// Process a captured video: validate duration, export at 1080p, generate thumbnail.
     static func processVideo(url: URL) async throws -> ProcessedMedia {
         let asset = AVURLAsset(url: url)
 
@@ -81,6 +84,10 @@ enum MediaProcessor {
             .appendingPathExtension("mov")
 
         try await exportVideo(asset: asset, to: outputURL, maxDuration: maxVideoDuration)
+
+        // Generate thumbnail from the local exported file before cleanup.
+        // Use t = min(0.5s, duration * 0.05) to avoid black first frames.
+        let thumbnailData = await generateThumbnail(from: outputURL, duration: durationSeconds)
 
         let data = try Data(contentsOf: outputURL)
 
@@ -97,7 +104,8 @@ enum MediaProcessor {
             contentType: .video,
             fileExtension: "mov",
             mimeType: "video/quicktime",
-            durationMs: durationMs
+            durationMs: durationMs,
+            thumbnailData: thumbnailData
         )
     }
 
@@ -157,6 +165,31 @@ enum MediaProcessor {
 
         guard CGImageDestinationFinalize(destination) else { return nil }
         return data as Data
+    }
+
+    // MARK: - Thumbnail Generation
+
+    /// Extract a JPEG thumbnail from a local video file.
+    /// Uses t = min(0.5s, duration * 0.05) to avoid black first frames.
+    /// Resizes to 720px width max, JPEG quality 0.75.
+    private static func generateThumbnail(from videoURL: URL, duration: Double) async -> Data? {
+        let asset = AVURLAsset(url: videoURL)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 720, height: 1280)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+
+        // Pick a frame slightly after the start to avoid black first frames
+        let seekTime = min(0.5, duration * 0.05)
+        let time = CMTime(seconds: seekTime, preferredTimescale: 600)
+
+        guard let result = try? await generator.image(at: time) else {
+            return nil
+        }
+
+        let image = UIImage(cgImage: result.image)
+        return image.jpegData(compressionQuality: 0.75)
     }
 
     // MARK: - Video Helpers
