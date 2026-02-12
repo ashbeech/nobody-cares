@@ -199,8 +199,17 @@ struct CreateView: View {
     // MARK: - Capture Actions
 
     private func capturePhoto() {
-        guard !isProcessing else { return }
+        FeedDebugLogger.log(.camera, "CreateView.capturePhoto()", detail: "isProcessing=\(isProcessing) controller=\(cameraController == nil ? "nil" : "set")")
+        guard !isProcessing else {
+            FeedDebugLogger.log(.camera, "⚠️ capturePhoto() bailed — isProcessing already true")
+            return
+        }
         isProcessing = true
+        if cameraController == nil {
+            FeedDebugLogger.log(.camera, "⚠️ cameraController is nil — capture will no-op, resetting isProcessing")
+            isProcessing = false
+            return
+        }
         cameraController?.capturePhoto()
     }
 
@@ -240,42 +249,77 @@ struct CreateView: View {
     // MARK: - Handle Capture Results
 
     private func handleCaptureResult(_ result: CaptureResult) {
-        print("[Upload] handleCaptureResult called, type: \(result)")
-        uploadTask = Task { @MainActor in
+        FeedDebugLogger.log(.upload, "handleCaptureResult called", detail: "type=\(result)")
+
+        // The outer Task inherits @MainActor from the SwiftUI view context.
+        // Async calls (location, upload) yield the main thread via await.
+        // Photo processing is dispatched to a background thread via Task.detached
+        // so it never blocks the main actor.
+        uploadTask = Task {
+            #if DEBUG
+            let t0 = CFAbsoluteTimeGetCurrent()
+            FeedDebugLogger.log(.upload, "Pipeline started")
+            #endif
+
             do {
-                // Check location permission first
+                // Check location permission (quick property read, fine on main)
                 guard permissionService.isLocationAuthorized else {
-                    print("[Upload] Location permission not granted (status: \(permissionService.locationStatus.rawValue))")
+                    FeedDebugLogger.log(.upload, "⚠️ Location permission not granted", detail: "status=\(permissionService.locationStatus.rawValue)")
                     throw CaptureError.locationPermissionDenied
                 }
 
-                // Get current location (10s timeout)
-                print("[Upload] Requesting location...")
+                // Get current location (async — yields main thread)
+                FeedDebugLogger.log(.upload, "Requesting location...")
                 guard let location = await permissionService.fetchCurrentLocation() else {
                     throw CaptureError.noLocation
                 }
                 try Task.checkCancellation()
-                print("[Upload] Location acquired: \(location.coordinate), accuracy: \(location.horizontalAccuracy)m")
+
+                #if DEBUG
+                FeedDebugLogger.log(.upload, "Location acquired in \(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s", detail: "\(location.coordinate) acc=\(location.horizontalAccuracy)m")
+                #else
+                FeedDebugLogger.log(.upload, "Location acquired", detail: "\(location.coordinate) acc=\(location.horizontalAccuracy)m")
+                #endif
 
                 // Validate accuracy
                 guard location.horizontalAccuracy < 100 else {
                     throw CaptureError.poorAccuracy(location.horizontalAccuracy)
                 }
 
-                // Process media
-                print("[Upload] Processing media...")
+                // Process media — photo processing dispatched off-main
+                FeedDebugLogger.log(.upload, "Processing media...")
+                #if DEBUG
+                let tProc = CFAbsoluteTimeGetCurrent()
+                #endif
+
                 let processedMedia: ProcessedMedia
                 switch result {
                 case .photo(let data, _):
-                    processedMedia = try MediaProcessor.processPhoto(data: data)
+                    // Dispatch synchronous photo processing to a background thread.
+                    // This is the key fix: processPhoto does heavy ImageIO decode + encode
+                    // and must not run on the main actor.
+                    FeedDebugLogger.log(.upload, "Dispatching photo processing off-main", detail: "\(data.count) bytes input")
+                    processedMedia = try await Task.detached(priority: .userInitiated) {
+                        try MediaProcessor.processPhoto(data: data)
+                    }.value
                 case .video(let url):
+                    // Already async — runs off-main via the generic executor
                     processedMedia = try await MediaProcessor.processVideo(url: url)
                 }
                 try Task.checkCancellation()
-                print("[Upload] Media processed: \(processedMedia.contentType.rawValue), \(processedMedia.fileSizeBytes) bytes")
 
-                // Upload
-                print("[Upload] Starting upload pipeline...")
+                #if DEBUG
+                FeedDebugLogger.log(.upload, "Media processed in \(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - tProc))s", detail: "\(processedMedia.contentType.rawValue) \(processedMedia.fileSizeBytes) bytes")
+                #else
+                FeedDebugLogger.log(.upload, "Media processed", detail: "\(processedMedia.contentType.rawValue) \(processedMedia.fileSizeBytes) bytes")
+                #endif
+
+                // Upload (async — yields main thread)
+                FeedDebugLogger.log(.upload, "Starting upload...")
+                #if DEBUG
+                let tUpload = CFAbsoluteTimeGetCurrent()
+                #endif
+
                 try await UploadService.shared.upload(
                     media: processedMedia,
                     latitude: location.coordinate.latitude,
@@ -283,9 +327,14 @@ struct CreateView: View {
                     horizontalAccuracy: location.horizontalAccuracy,
                     appAttest: appAttestService
                 )
-                print("[Upload] Upload complete!")
 
-                // Success — switch to feed, show banner
+                #if DEBUG
+                FeedDebugLogger.log(.upload, "✅ Upload complete in \(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - tUpload))s", detail: "total=\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s")
+                #else
+                FeedDebugLogger.log(.upload, "✅ Upload complete")
+                #endif
+
+                // Success — switch to feed, show banner (on main actor)
                 AnalyticsService.shared.track(.contentCreated, metadata: [
                     "type": processedMedia.contentType.rawValue,
                 ])
@@ -295,10 +344,10 @@ struct CreateView: View {
                     appState.showArchivedBanner = true
                 }
             } catch is CancellationError {
-                print("[Upload] Cancelled by user")
+                FeedDebugLogger.log(.upload, "Cancelled by user")
                 isProcessing = false
             } catch {
-                print("[Upload] Failed: \(error)")
+                FeedDebugLogger.log(.upload, "❌ Failed: \(error)")
                 isProcessing = false
                 errorMessage = mapCaptureError(error)
                 showError = true
@@ -310,6 +359,7 @@ struct CreateView: View {
     }
 
     private func handleCaptureError(_ error: String) {
+        FeedDebugLogger.log(.camera, "⚠️ handleCaptureError: \(error)")
         Task { @MainActor in
             isProcessing = false
             isRecording = false
