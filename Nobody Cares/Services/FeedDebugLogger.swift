@@ -29,6 +29,8 @@ enum DebugSubsystem: String {
     case media  = "MEDIA"
     case loc    = "LOC"
     case radar  = "RADAR"
+    case camera = "CAM"
+    case upload = "UPLOAD"
 }
 
 enum FeedDebugLogger {

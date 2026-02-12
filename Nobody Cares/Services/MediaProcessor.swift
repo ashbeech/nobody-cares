@@ -11,9 +11,7 @@
 //
 
 import AVFoundation
-import CoreImage
 import ImageIO
-import UIKit
 import UniformTypeIdentifiers
 
 // MARK: - Processed Media
@@ -40,17 +38,32 @@ enum MediaProcessor {
 
     // MARK: - Photo Processing
 
-    /// Process a captured photo: resize, compress, strip EXIF.
+    /// Process a captured photo: downsample, compress, strip EXIF.
+    ///
+    /// Uses ImageIO to decode directly at the target resolution, avoiding
+    /// the full-size bitmap allocation that `UIImage(data:)` + redraw requires.
+    /// Safe to call from any thread (no UIKit dependency).
     static func processPhoto(data: Data) throws -> ProcessedMedia {
-        guard let sourceImage = UIImage(data: data) else {
+        #if DEBUG
+        let t0 = CFAbsoluteTimeGetCurrent()
+        #endif
+
+        guard let cgImage = downsampledCGImage(from: data, maxPixelSize: Int(maxDimension)) else {
             throw CaptureError.processingFailed
         }
 
-        // Resize to max dimension
-        let resized = resizeImage(sourceImage, maxDimension: maxDimension)
+        #if DEBUG
+        let t1 = CFAbsoluteTimeGetCurrent()
+        print("[MediaProcessor] Downsample: \(String(format: "%.3f", t1 - t0))s → \(cgImage.width)×\(cgImage.height)")
+        #endif
 
-        // Try HEIF first, fall back to JPEG
-        let (processedData, fileExtension, mimeType) = compressImage(resized)
+        // Encode: HEIC preferred, JPEG fallback
+        let (processedData, fileExtension, mimeType) = try encodeCGImage(cgImage)
+
+        #if DEBUG
+        let t2 = CFAbsoluteTimeGetCurrent()
+        print("[MediaProcessor] Encode (\(fileExtension)): \(String(format: "%.3f", t2 - t1))s → \(processedData.count) bytes")
+        #endif
 
         // Validate size
         guard processedData.count <= maxFileSize else {
@@ -109,61 +122,89 @@ enum MediaProcessor {
         )
     }
 
-    // MARK: - Image Helpers
+    // MARK: - ImageIO Helpers
 
-    private static func resizeImage(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
-        let size = image.size
-        let longestEdge = max(size.width, size.height)
-
-        guard longestEdge > maxDimension else { return image }
-
-        let scale = maxDimension / longestEdge
-        let newSize = CGSize(
-            width: floor(size.width * scale),
-            height: floor(size.height * scale)
-        )
-
-        let renderer = UIGraphicsImageRenderer(size: newSize)
-        return renderer.image { _ in
-            image.draw(in: CGRect(origin: .zero, size: newSize))
+    /// Decode + downsample in a single pass via ImageIO.
+    /// This avoids allocating the full-resolution bitmap that `UIImage(data:)` requires.
+    /// On a 48 MP capture the difference is ~180 MB vs ~12 MB of pixel data.
+    private static func downsampledCGImage(from data: Data, maxPixelSize: Int) -> CGImage? {
+        let sourceOptions: [CFString: Any] = [
+            kCGImageSourceShouldCache: false,
+        ]
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions as CFDictionary) else {
+            return nil
         }
+
+        let downsampleOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, downsampleOptions as CFDictionary)
     }
 
-    private static func compressImage(_ image: UIImage) -> (Data, String, String) {
-        // Try HEIF first
-        if let heifData = heifData(from: image, quality: compressionQuality) {
-            return (heifData, "heic", "image/heic")
+    /// Encode a CGImage to HEIC (preferred) or JPEG (fallback).
+    private static func encodeCGImage(_ cgImage: CGImage) throws -> (Data, String, String) {
+        // Photos are always opaque. CGImageSource may produce a thumbnail with an
+        // alpha channel (AlphaPremulLast) inherited from the source container.
+        // Stripping it prevents CGImageDestination warnings and halves decode memory.
+        let opaqueImage = opaqueVariant(of: cgImage)
+
+        // Try HEIC first
+        if let heicData = encodeToFormat(opaqueImage, type: UTType.heic.identifier as CFString, quality: compressionQuality) {
+            return (heicData, "heic", "image/heic")
         }
 
         // Fall back to JPEG
-        if let jpegData = image.jpegData(compressionQuality: compressionQuality) {
+        if let jpegData = encodeToFormat(opaqueImage, type: UTType.jpeg.identifier as CFString, quality: compressionQuality) {
             return (jpegData, "jpg", "image/jpeg")
         }
 
-        // Last resort — PNG
-        let pngData = image.pngData() ?? Data()
-        return (pngData, "png", "image/png")
+        throw CaptureError.processingFailed
     }
 
-    private static func heifData(from image: UIImage, quality: CGFloat) -> Data? {
-        guard let cgImage = image.cgImage else { return nil }
+    /// Return a copy of `image` with the alpha channel stripped (noneSkipLast).
+    /// If the image is already opaque, returns it unchanged.
+    private static func opaqueVariant(of image: CGImage) -> CGImage {
+        let alpha = image.alphaInfo
+        if alpha == .none || alpha == .noneSkipFirst || alpha == .noneSkipLast {
+            return image
+        }
 
+        let colorSpace = image.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: image.bitsPerComponent,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else { return image }
+
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return ctx.makeImage() ?? image
+    }
+
+    /// Encode a CGImage to the given UTType using CGImageDestination.
+    /// EXIF is stripped by virtue of not copying source metadata.
+    private static func encodeToFormat(_ cgImage: CGImage, type: CFString, quality: CGFloat) -> Data? {
         let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(
-            data,
-            UTType.heic.identifier as CFString,
-            1,
-            nil
-        ) else { return nil }
+        guard let destination = CGImageDestinationCreateWithData(data, type, 1, nil) else {
+            return nil
+        }
 
         let options: [CFString: Any] = [
             kCGImageDestinationLossyCompressionQuality: quality,
-            // Strip EXIF by not copying metadata
         ]
 
         CGImageDestinationAddImage(destination, cgImage, options as CFDictionary)
 
-        guard CGImageDestinationFinalize(destination) else { return nil }
+        guard CGImageDestinationFinalize(destination) else {
+            return nil
+        }
         return data as Data
     }
 
@@ -188,8 +229,8 @@ enum MediaProcessor {
             return nil
         }
 
-        let image = UIImage(cgImage: result.image)
-        return image.jpegData(compressionQuality: 0.75)
+        // Encode CGImage directly via ImageIO (no UIImage dependency)
+        return encodeToFormat(result.image, type: UTType.jpeg.identifier as CFString, quality: 0.75)
     }
 
     // MARK: - Video Helpers

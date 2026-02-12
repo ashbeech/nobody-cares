@@ -44,6 +44,12 @@ final class CameraPreviewController: UIViewController {
     private var recordingTimer: Timer?
     private let maxRecordingDuration: TimeInterval = 6.0
 
+    /// Strong reference to the photo capture delegate.
+    /// AVCapturePhotoOutput retains the delegate on its session queue, but ARC
+    /// can release the local before that retention takes effect. Storing it here
+    /// keeps it alive until the capture lifecycle completes.
+    private var photoCaptureDelegate: PhotoCaptureDelegate?
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -157,7 +163,11 @@ final class CameraPreviewController: UIViewController {
     // MARK: - Photo Capture
 
     func capturePhoto() {
-        guard !isRecording else { return }
+        FeedDebugLogger.log(.camera, "capturePhoto() called", detail: "isRecording=\(isRecording) sessionRunning=\(session.isRunning)")
+        guard !isRecording else {
+            FeedDebugLogger.log(.camera, "⚠️ capturePhoto() bailed — isRecording=true")
+            return
+        }
 
         let settings = AVCapturePhotoSettings()
 
@@ -173,18 +183,24 @@ final class CameraPreviewController: UIViewController {
 
         // Request the highest resolution the output supports
         captureSettings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+        FeedDebugLogger.log(.camera, "Initiating capture", detail: "dims=\(captureSettings.maxPhotoDimensions.width)×\(captureSettings.maxPhotoDimensions.height) hevc=\(photoOutput.availablePhotoCodecTypes.contains(.hevc))")
 
         let delegate = PhotoCaptureDelegate { [weak self] result in
             DispatchQueue.main.async {
+                self?.photoCaptureDelegate = nil
                 self?.onCapture?(result)
             }
         } onError: { [weak self] error in
             DispatchQueue.main.async {
+                self?.photoCaptureDelegate = nil
                 self?.onError?(error)
             }
         }
-        objc_setAssociatedObject(captureSettings, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
+
+        // Keep a strong reference until the capture lifecycle completes.
+        photoCaptureDelegate = delegate
         photoOutput.capturePhoto(with: captureSettings, delegate: delegate)
+        FeedDebugLogger.log(.camera, "capturePhoto(with:delegate:) dispatched")
     }
 
     // MARK: - Video Recording
@@ -232,25 +248,57 @@ final class CameraPreviewController: UIViewController {
 private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     let onResult: (CaptureResult) -> Void
     let onError: (String) -> Void
+    private var didDeliverResult = false
 
     init(onResult: @escaping (CaptureResult) -> Void, onError: @escaping (String) -> Void) {
         self.onResult = onResult
         self.onError = onError
     }
 
+    deinit {
+        FeedDebugLogger.log(.camera, "PhotoCaptureDelegate deallocated", detail: "didDeliverResult=\(didDeliverResult)")
+    }
+
+    // 1. Called first — capture is starting
+    func photoOutput(
+        _ output: AVCapturePhotoOutput,
+        willBeginCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings
+    ) {
+        FeedDebugLogger.log(.camera, "willBeginCapture", detail: "id=\(resolvedSettings.uniqueID) dims=\(resolvedSettings.photoDimensions.width)×\(resolvedSettings.photoDimensions.height)")
+    }
+
+    // 2. Called at shutter moment
+    func photoOutput(
+        _ output: AVCapturePhotoOutput,
+        willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings
+    ) {
+        FeedDebugLogger.log(.camera, "willCapturePhoto (shutter)")
+    }
+
+    // 3. Called after sensor capture complete
+    func photoOutput(
+        _ output: AVCapturePhotoOutput,
+        didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings
+    ) {
+        FeedDebugLogger.log(.camera, "didCapturePhoto (sensor done)")
+    }
+
+    // 4. Called with processed photo data
     func photoOutput(
         _ output: AVCapturePhotoOutput,
         didFinishProcessingPhoto photo: AVCapturePhoto,
         error: Error?
     ) {
-        print("[Camera] Photo delegate fired, error: \(error?.localizedDescription ?? "none")")
+        FeedDebugLogger.log(.camera, "📸 didFinishProcessingPhoto", detail: "error=\(error?.localizedDescription ?? "none")")
         if let error {
+            didDeliverResult = true
             onError("Photo capture failed: \(error.localizedDescription)")
             return
         }
 
         guard let data = photo.fileDataRepresentation() else {
-            print("[Camera] Failed to get photo data representation")
+            FeedDebugLogger.log(.camera, "⚠️ Failed to get photo data representation")
+            didDeliverResult = true
             onError("Failed to get photo data")
             return
         }
@@ -259,8 +307,24 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
         let isHEIF = photo.resolvedSettings.photoProcessingTimeRange.duration != .zero
             || String(describing: type(of: photo)).contains("HEIF")
 
-        print("[Camera] Photo captured: \(data.count) bytes, isHEIF: \(isHEIF)")
+        FeedDebugLogger.log(.camera, "Photo captured", detail: "\(data.count) bytes, isHEIF=\(isHEIF)")
+        didDeliverResult = true
         onResult(.photo(data, isHEIF: isHEIF))
+    }
+
+    // 5. Called LAST — always, even if earlier stages fail
+    func photoOutput(
+        _ output: AVCapturePhotoOutput,
+        didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
+        error: Error?
+    ) {
+        FeedDebugLogger.log(.camera, "didFinishCapture (final)", detail: "error=\(error?.localizedDescription ?? "none") delivered=\(didDeliverResult)")
+        // If we got here with an error and never delivered a result,
+        // the capture failed before processing — report it now.
+        if let error, !didDeliverResult {
+            didDeliverResult = true
+            onError("Photo capture failed: \(error.localizedDescription)")
+        }
     }
 }
 
