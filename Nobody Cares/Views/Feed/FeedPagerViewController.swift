@@ -165,6 +165,16 @@ final class FeedPagerViewController: UIViewController {
             FeedDebugLogger.log(.pager, "updateItems — collectionView not yet loaded, deferring")
             return
         }
+
+        // reloadData() invalidates any in-flight animated setContentOffset.
+        // scrollViewDidEndScrollingAnimation will never fire for the killed
+        // animation, so clear the flag now to avoid permanently blocking
+        // future scrolls via isScrollBusy.
+        if isProgrammaticScroll {
+            FeedDebugLogger.log(.pager, "updateItems — clearing stuck isProgrammaticScroll")
+            isProgrammaticScroll = false
+        }
+
         collectionView.reloadData()
 
         // Clamp current index
@@ -184,11 +194,14 @@ final class FeedPagerViewController: UIViewController {
     }
 
     /// Programmatic scroll (auto-advance or ViewModel-driven).
+    ///
+    /// **Animated** scrolls (auto-advance ±1) respect the busy guards — we must
+    /// not fight a user drag or ongoing deceleration.
+    ///
+    /// **Non-animated** scrolls (e.g. REFRESH → index 0) bypass ALL guards:
+    /// they first kill any ongoing momentum, then snap the offset instantly.
+    /// There is no animation to conflict with, so there is nothing to guard.
     func scrollToIndex(_ index: Int, animated: Bool) {
-        guard !collectionView.isDragging, !collectionView.isDecelerating else {
-            FeedDebugLogger.log(.pager, "scrollToIndex(\(index)) — BLOCKED (scroll busy)")
-            return
-        }
         guard index >= 0, index < items.count else {
             FeedDebugLogger.log(.pager, "scrollToIndex(\(index)) — BLOCKED (out of range, count=\(items.count))")
             return
@@ -196,12 +209,24 @@ final class FeedPagerViewController: UIViewController {
         let H = collectionView.bounds.height
         guard H > 0 else { return }
 
-        FeedDebugLogger.log(.pager, "scrollToIndex(\(index), animated=\(animated)) — programmatic scroll")
-        isProgrammaticScroll = true
-        collectionView.setContentOffset(CGPoint(x: 0, y: CGFloat(index) * H), animated: animated)
+        if animated {
+            // Animated: respect scroll-busy guards
+            guard !collectionView.isDragging, !collectionView.isDecelerating else {
+                FeedDebugLogger.log(.pager, "scrollToIndex(\(index)) — BLOCKED (scroll busy)")
+                return
+            }
 
-        if !animated {
+            FeedDebugLogger.log(.pager, "scrollToIndex(\(index), animated=true) — programmatic scroll")
+            isProgrammaticScroll = true
+            collectionView.setContentOffset(CGPoint(x: 0, y: CGFloat(index) * H), animated: true)
+        } else {
+            // Non-animated: force-stop any ongoing scroll, then snap instantly.
+            // Setting contentOffset to the current value with animated:false is
+            // a standard UIKit trick to kill deceleration momentum.
+            FeedDebugLogger.log(.pager, "scrollToIndex(\(index), animated=false) — instant snap")
+            collectionView.setContentOffset(collectionView.contentOffset, animated: false)
             isProgrammaticScroll = false
+            collectionView.setContentOffset(CGPoint(x: 0, y: CGFloat(index) * H), animated: false)
             handlePageCommit()
         }
     }

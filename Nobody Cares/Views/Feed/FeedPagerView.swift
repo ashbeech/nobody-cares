@@ -93,10 +93,23 @@ struct FeedPagerView: UIViewControllerRepresentable {
         // User ID
         vc.currentUserId = appState.userId
 
-        // Programmatic index change (auto-advance).
-        // isScrollBusy includes isProgrammaticScroll so we don't re-trigger mid-animation.
-        if vc.currentIndex != viewModel.currentIndex && !vc.isScrollBusy {
-            vc.scrollToIndex(viewModel.currentIndex, animated: true)
+        // Programmatic index change (auto-advance or refresh).
+        //
+        // • Single-page hop (±1, e.g. auto-advance): animate smoothly.
+        //   Respect isScrollBusy to avoid fighting a user drag or deceleration.
+        //
+        // • Multi-page jump (e.g. REFRESH from last item → 0): snap instantly.
+        //   Bypass isScrollBusy — scrollToIndex(animated:false) will force-stop
+        //   any ongoing momentum before snapping.
+        if vc.currentIndex != viewModel.currentIndex {
+            let distance = abs(vc.currentIndex - viewModel.currentIndex)
+            if distance > 1 {
+                // Multi-page: instant snap, bypass busy guard
+                vc.scrollToIndex(viewModel.currentIndex, animated: false)
+            } else if !vc.isScrollBusy {
+                // Single-page: smooth animation, respect busy guard
+                vc.scrollToIndex(viewModel.currentIndex, animated: true)
+            }
         }
 
         // Refresh completion

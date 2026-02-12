@@ -77,28 +77,35 @@ final class MediaPreloader {
     // MARK: - Public: Buffer Management
 
     /// Ensure currentIndex ± 2 are being prepared; cancel anything outside that window.
+    /// When the feed is small enough to fit entirely in the player pool, keep
+    /// *all* items loaded — this avoids releasing content the user already saw
+    /// and ensures instant playback when they tap REFRESH to loop back.
     func updateBuffer(around currentIndex: Int) {
         let count = items.count
         guard count > 0 else { return }
 
-        let lo = max(0, currentIndex - 2)
-        let hi = min(count - 1, currentIndex + 2)
+        // If every item fits in the pool, keep them all loaded (no eviction).
+        let keepAll = count <= pool.count
+        let lo = keepAll ? 0 : max(0, currentIndex - 2)
+        let hi = keepAll ? count - 1 : min(count - 1, currentIndex + 2)
         let needed = Set(lo...hi)
 
-        // Cancel anything outside the window
-        let allKnown = Set(
-            Array(slotAssignments.keys) +
-            Array(preparationTasks.keys) +
-            Array(readiness.keys)
-        )
+        // Cancel anything outside the window (skip when keeping everything)
         var releasedOutside = 0
-        for idx in allKnown where !needed.contains(idx) {
-            release(index: idx)
-            releasedOutside += 1
+        if !keepAll {
+            let allKnown = Set(
+                Array(slotAssignments.keys) +
+                Array(preparationTasks.keys) +
+                Array(readiness.keys)
+            )
+            for idx in allKnown where !needed.contains(idx) {
+                release(index: idx)
+                releasedOutside += 1
+            }
         }
 
         let readyInWindow = needed.filter { readiness[$0] == true }.count
-        FeedDebugLogger.log(.media, "updateBuffer(around: \(currentIndex)) — window=[\(lo)…\(hi)], ready=\(readyInWindow)/\(needed.count), released=\(releasedOutside) outside")
+        FeedDebugLogger.log(.media, "updateBuffer(around: \(currentIndex)) — window=[\(lo)…\(hi)], keepAll=\(keepAll), ready=\(readyInWindow)/\(needed.count), released=\(releasedOutside) outside")
 
         // Prepare inside the window (current first, then immediate neighbors, then ±2)
         prepare(index: currentIndex)
@@ -106,6 +113,13 @@ final class MediaPreloader {
         if currentIndex + 1 < count { prepare(index: currentIndex + 1) }
         if currentIndex - 2 >= 0 { prepare(index: currentIndex - 2) }
         if currentIndex + 2 < count { prepare(index: currentIndex + 2) }
+
+        // When keeping all, also prepare indices outside ±2 that weren't covered above
+        if keepAll {
+            for idx in 0..<count where abs(idx - currentIndex) > 2 {
+                prepare(index: idx)
+            }
+        }
     }
 
     // MARK: - Public: Playback Control
