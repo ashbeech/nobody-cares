@@ -66,6 +66,7 @@ final class FeedViewModel {
     var isPaused: Bool = false
     var progress: Double = 0.0
     var isRefreshing: Bool = false
+    var isTimerPaused: Bool = false
     var showEndOfFeedAlert: Bool = false
 
     /// Per-item range states for proximity overlays. Published so the pager can observe.
@@ -713,7 +714,7 @@ final class FeedViewModel {
 
         progressTimer = Timer.scheduledTimer(withTimeInterval: progressInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, !self.isPaused else { return }
+                guard let self, !self.isPaused, !self.isTimerPaused else { return }
                 self.progress += self.progressInterval / self.autoAdvanceDuration
                 if self.progress >= 1.0 {
                     self.progress = 1.0
@@ -737,7 +738,7 @@ final class FeedViewModel {
             // Blocked — retry periodically
             autoAdvanceTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 Task { @MainActor in
-                    guard let self, !self.isPaused else { return }
+                    guard let self, !self.isPaused, !self.isTimerPaused else { return }
                     if self.advanceToNext() {
                         self.autoAdvanceTimer?.invalidate()
                         self.autoAdvanceTimer = nil
@@ -885,6 +886,10 @@ final class FeedViewModel {
             FeedDebugLogger.log(.feed, "onPagerScrollSettled — SKIPPED (refreshing)")
             return
         }
+        guard !isTimerPaused else {
+            FeedDebugLogger.log(.feed, "onPagerScrollSettled — SKIPPED (timer paused by modal)")
+            return
+        }
         FeedDebugLogger.log(.feed, "onPagerScrollSettled — restarting auto-advance at index \(currentIndex)")
         startAutoAdvance()
     }
@@ -892,11 +897,14 @@ final class FeedViewModel {
     func dismissEndOfFeedAlert() {
         FeedDebugLogger.log(.feed, "dismissEndOfFeedAlert — user dismissed without refresh")
         showEndOfFeedAlert = false
+        isTimerPaused = false
+        startAutoAdvance()
     }
 
     func refreshFeedFromAlert() {
         FeedDebugLogger.log(.feed, "refreshFeedFromAlert — user tapped REFRESH on endOfFeed alert")
         showEndOfFeedAlert = false
+        isTimerPaused = false
         stopAutoAdvance()
         progress = 0.0
 
