@@ -80,6 +80,13 @@ final class FeedViewModel {
     private var isLocationRefreshInFlight = false
     private var hysteresisTimers: [UUID: Timer] = [:]
     private var itemVisibility: [UUID: ContentVisibility] = [:]
+
+    /// Query radius ratchet: once content is found at a wider radius
+    /// (due to momentarily poor accuracy), don't shrink the radius when
+    /// accuracy later improves — that would make visible items vanish.
+    /// Bounded by the 100 m cap in effectiveRadius.  Reset in startFeed().
+    private var sessionMaxRadius: Double = 10.0
+
     private let autoAdvanceDuration: TimeInterval = 6.0
     private let progressInterval: TimeInterval = 1.0 / 60.0 // 60fps
     private let enterRadius: Double = 10.0
@@ -97,11 +104,20 @@ final class FeedViewModel {
         !items.isEmpty
     }
 
+    /// Returns the effective query radius, ratcheted so it never shrinks
+    /// below the widest radius that previously returned content.
+    private func queryRadius() -> Double {
+        let effective = locationService.effectiveRadius
+        sessionMaxRadius = max(sessionMaxRadius, effective)
+        return sessionMaxRadius
+    }
+
     // MARK: - Lifecycle
 
     func startFeed() {
         FeedDebugLogger.log(.feed, "startFeed() called — setting state to .loading")
         feedState = .loading
+        sessionMaxRadius = 10.0
 
         // Set up location callbacks
         locationService.onSignificantMovement = { [weak self] in
@@ -188,7 +204,7 @@ final class FeedViewModel {
             return
         }
 
-        let radius = locationService.effectiveRadius
+        let radius = queryRadius()
         FeedDebugLogger.log(.feed, "refreshFromLocation — lat=\(location.coordinate.latitude) lng=\(location.coordinate.longitude) radius=\(radius)m")
 
         await feedDataService.refresh(
@@ -290,7 +306,7 @@ final class FeedViewModel {
                 return
             }
 
-            let radius = locationService.effectiveRadius
+            let radius = queryRadius()
             FeedDebugLogger.log(.feed, "smartRefresh — fetching at lat=\(location.coordinate.latitude) lng=\(location.coordinate.longitude) r=\(radius)m")
 
             do {
@@ -587,7 +603,7 @@ final class FeedViewModel {
     /// so we can preserve existing content on network errors.
     @MainActor
     private func performRefreshFetch(latitude: Double, longitude: Double) async {
-        let radius = locationService.effectiveRadius
+        let radius = queryRadius()
 
         do {
             let newItems = try await feedDataService.fetchNearbyContent(
@@ -645,7 +661,7 @@ final class FeedViewModel {
         await feedDataService.loadMore(
             latitude: location.coordinate.latitude,
             longitude: location.coordinate.longitude,
-            radius: locationService.effectiveRadius
+            radius: queryRadius()
         )
         if feedDataService.items.count > items.count {
             let newItems = feedDataService.items
