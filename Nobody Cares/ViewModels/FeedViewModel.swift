@@ -163,6 +163,13 @@ final class FeedViewModel {
             return
         }
 
+        // Don't refresh while a user-initiated refresh (pull-to-refresh or
+        // alert refresh) is already in flight — avoids concurrent state mutations.
+        guard !isRefreshing else {
+            FeedDebugLogger.log(.feed, "refreshFromLocation — SKIPPED (isRefreshing)")
+            return
+        }
+
         guard let location = locationService.currentLocation else {
             FeedDebugLogger.log(.feed, "refreshFromLocation — no currentLocation, attempting fetchCurrentLocation")
             // Try to get a location
@@ -282,10 +289,15 @@ final class FeedViewModel {
                     items = newItems
                     // Don't clear end-of-feed alert — content is identical
                 } else if newItems.isEmpty {
-                    FeedDebugLogger.log(.feed, "smartRefresh — EMPTY result (was \(items.count))")
-                    items = []
-                    mediaPreloader.cancelAll()
-                    feedState = .empty
+                    if !items.isEmpty {
+                        // GPS jitter guard: we had content, but refresh returned nothing.
+                        // Indoor GPS can drift 10-65m, pushing us outside the small radius.
+                        // Keep existing content instead of flashing the empty state.
+                        FeedDebugLogger.log(.feed, "smartRefresh — EMPTY result but had \(items.count) items → KEEPING existing content (GPS jitter guard)")
+                    } else {
+                        FeedDebugLogger.log(.feed, "smartRefresh — EMPTY result (no prior content), showing empty state")
+                        feedState = .empty
+                    }
                 } else {
                     FeedDebugLogger.log(.feed, "smartRefresh — DIFFERENT content: \(items.count)→\(newItems.count) items")
                     for (i, item) in newItems.enumerated() {
@@ -569,9 +581,19 @@ final class FeedViewModel {
             )
 
             if newItems.isEmpty {
-                items = []
-                mediaPreloader.cancelAll()
-                feedState = .empty
+                if !items.isEmpty {
+                    // GPS jitter guard: we had content, but refresh returned nothing.
+                    // Indoor GPS can drift 10-65m, pushing us outside the small radius.
+                    // Keep existing content and restart feed from the beginning.
+                    FeedDebugLogger.log(.feed, "performRefreshFetch — EMPTY result but had \(items.count) items → KEEPING existing content (GPS jitter guard)")
+                    currentIndex = 0
+                    feedState = .content
+                    mediaPreloader.updateBuffer(around: 0)
+                    startAutoAdvance()
+                } else {
+                    FeedDebugLogger.log(.feed, "performRefreshFetch — EMPTY result (no prior content), showing empty state")
+                    feedState = .empty
+                }
             } else {
                 mediaPreloader.setItems(newItems)
                 items = newItems

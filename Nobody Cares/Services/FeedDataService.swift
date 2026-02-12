@@ -30,7 +30,7 @@ final class FeedDataService {
     func fetchNearbyContent(
         latitude: Double,
         longitude: Double,
-        radius: Double = 10.0,
+        radius: Double = 30.0,
         offset: Int = 0
     ) async throws -> [ContentItem] {
         FeedDebugLogger.log(.data, "fetchNearbyContent — lat=\(latitude) lng=\(longitude) r=\(radius)m offset=\(offset)")
@@ -63,7 +63,7 @@ final class FeedDataService {
     }
 
     /// Refresh the feed from scratch
-    func refresh(latitude: Double, longitude: Double, radius: Double = 10.0) async {
+    func refresh(latitude: Double, longitude: Double, radius: Double = 30.0) async {
         FeedDebugLogger.log(.data, "refresh — START")
         do {
             let newItems = try await fetchNearbyContent(
@@ -81,7 +81,7 @@ final class FeedDataService {
     }
 
     /// Load the next page of content
-    func loadMore(latitude: Double, longitude: Double, radius: Double = 10.0) async {
+    func loadMore(latitude: Double, longitude: Double, radius: Double = 30.0) async {
         FeedDebugLogger.log(.data, "loadMore — offset=\(items.count)")
         do {
             let moreItems = try await fetchNearbyContent(
@@ -136,6 +136,15 @@ final class FeedDataService {
 
     /// Subscribe to new content in the given S2 cell (for stationary mode).
     /// When the user isn't moving, we listen for server-pushed updates instead of polling.
+    ///
+    /// Listens for both INSERT and UPDATE events:
+    ///   - INSERT: catches content created directly as visible (unlikely in normal flow,
+    ///     since upload-confirm activates content via UPDATE, but safe to handle).
+    ///   - UPDATE: catches content activation (is_deleted: true → false) from the
+    ///     upload-confirm Edge Function. This is the primary path for new content
+    ///     becoming visible in the feed.
+    ///
+    /// Requires: REPLICA IDENTITY FULL on the content table (see migration_v5).
     func subscribeToCell(cellId: String) async {
         FeedDebugLogger.log(.data, "subscribeToCell — \(cellId)")
         // Unsubscribe from previous cell
@@ -152,12 +161,26 @@ final class FeedDataService {
             filter: .eq("cell_id", value: cellId)
         )
 
+        let updates = channel.postgresChange(
+            UpdateAction.self,
+            schema: "public",
+            table: "content",
+            filter: .eq("cell_id", value: cellId)
+        )
+
         try? await channel.subscribeWithError()
 
-        // Listen for new content
+        // Handle INSERT events
         Task {
             for await insertion in insertions {
-                await handleNewContent(insertion)
+                await handleRealtimeChange(record: insertion.record, event: "INSERT")
+            }
+        }
+
+        // Handle UPDATE events (content activation)
+        Task {
+            for await update in updates {
+                await handleRealtimeChange(record: update.record, event: "UPDATE")
             }
         }
 
@@ -173,14 +196,27 @@ final class FeedDataService {
         currentCellId = nil
     }
 
-    private func handleNewContent(_ action: InsertAction) async {
-        // The Realtime payload contains the raw row data but not the joined
-        // query result (username, distance, signed URL). Rather than trying
-        // to reconstruct a partial ContentItem, signal the feed to refresh
-        // so it can re-fetch via the full get_nearby_content RPC.
-        guard action.record["id"] != nil else { return }
+    /// Unified handler for Realtime INSERT and UPDATE events on the content table.
+    ///
+    /// Only posts a refresh notification if the content is now visible (is_deleted = false).
+    /// This filters out:
+    ///   - INSERT events for newly created (not yet confirmed) content (is_deleted = true)
+    ///   - UPDATE events for soft-deletions or other non-activation updates
+    ///
+    /// The Realtime payload contains the raw row data but not the joined
+    /// query result (username, distance, signed URL). Rather than trying
+    /// to reconstruct a partial ContentItem, we signal the feed to refresh
+    /// so it can re-fetch via the full get_nearby_content RPC.
+    private func handleRealtimeChange(record: [String: AnyJSON], event: String) async {
+        // Only trigger refresh if the content is visible (is_deleted = false).
+        guard record["is_deleted"]?.boolValue == false else {
+            FeedDebugLogger.log(.data, "⚡ Realtime \(event) detected — SKIPPED (content not visible)")
+            return
+        }
 
-        FeedDebugLogger.log(.data, "⚡ Realtime INSERT detected — posting newNearbyContentAvailable")
+        guard record["id"] != nil else { return }
+
+        FeedDebugLogger.log(.data, "⚡ Realtime \(event) detected — posting newNearbyContentAvailable")
         await MainActor.run {
             NotificationCenter.default.post(name: .newNearbyContentAvailable, object: nil)
         }
