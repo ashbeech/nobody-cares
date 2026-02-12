@@ -77,6 +77,7 @@ final class FeedViewModel {
 
     private var autoAdvanceTimer: Timer?
     private var progressTimer: Timer?
+    private var isLocationRefreshInFlight = false
     private var hysteresisTimers: [UUID: Timer] = [:]
     private var itemVisibility: [UUID: ContentVisibility] = [:]
     private let autoAdvanceDuration: TimeInterval = 6.0
@@ -163,6 +164,16 @@ final class FeedViewModel {
             return
         }
 
+        // Prevent concurrent location refreshes: movement callbacks and periodic
+        // timers can overlap, producing races where the last-to-finish overwrites
+        // a valid result with stale data.
+        guard !isLocationRefreshInFlight else {
+            FeedDebugLogger.log(.feed, "refreshFromLocation — SKIPPED (refresh already in flight)")
+            return
+        }
+        isLocationRefreshInFlight = true
+        defer { isLocationRefreshInFlight = false }
+
         guard let location = locationService.currentLocation else {
             FeedDebugLogger.log(.feed, "refreshFromLocation — no currentLocation, attempting fetchCurrentLocation")
             // Try to get a location
@@ -209,6 +220,23 @@ final class FeedViewModel {
             FeedDebugLogger.log(.feed, "refreshFromLocation — GOT \(newItems.count) items (had \(items.count))", detail: "hadContent=\(hadContent)")
             for (i, item) in newItems.enumerated() {
                 FeedDebugLogger.log(.feed, "  [\(i)] \(item.contentType.rawValue) id=\(item.id.uuidString.prefix(8))… dist=\(String(format: "%.1f", item.distanceMeters))m @\(item.username)")
+            }
+
+            // GPS jitter guard (extended): when we already have content and the
+            // new result only *removed* items (no new IDs appeared), keep existing
+            // content.  GPS noise can temporarily push the query point away from
+            // nearby content, making items drop out of the small radius.
+            // Content removal should only happen via user-initiated actions
+            // (pull-to-refresh, refresh-from-alert).
+            if hadContent && newItems.count < items.count {
+                let existingIds = Set(items.map(\.id))
+                let newIds = Set(newItems.map(\.id))
+                let addedIds = newIds.subtracting(existingIds)
+
+                if addedIds.isEmpty {
+                    FeedDebugLogger.log(.feed, "refreshFromLocation — result shrank \(items.count)→\(newItems.count) with no new items → KEEPING existing content (GPS jitter guard)")
+                    return
+                }
             }
 
             mediaPreloader.setItems(newItems)
@@ -569,9 +597,21 @@ final class FeedViewModel {
             )
 
             if newItems.isEmpty {
-                items = []
-                mediaPreloader.cancelAll()
-                feedState = .empty
+                // When GPS accuracy is poor, an empty result usually means the
+                // query position drifted far from the user's real location.
+                // Don't nuke existing content — restart auto-advance instead.
+                let accuracy = locationService.currentLocation?.horizontalAccuracy ?? 0
+                if !items.isEmpty && accuracy > 15 {
+                    FeedDebugLogger.log(.feed, "performRefreshFetch — EMPTY result with poor accuracy (\(String(format: "%.0f", accuracy))m), keeping existing \(items.count) items")
+                    currentIndex = 0
+                    feedState = .content
+                    mediaPreloader.updateBuffer(around: 0)
+                    startAutoAdvance()
+                } else {
+                    items = []
+                    mediaPreloader.cancelAll()
+                    feedState = .empty
+                }
             } else {
                 mediaPreloader.setItems(newItems)
                 items = newItems

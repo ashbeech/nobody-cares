@@ -35,13 +35,18 @@ final class LocationService {
     var isSimulatedLocation = false
     var isLowAccuracy = false
 
-    /// Effective search radius — widened when accuracy is poor
+    /// Effective search radius — widened when accuracy is poor.
+    ///
+    /// With GPS accuracy of X meters, the reported position can be up to X m
+    /// from reality.  A 10 m radius centred on a position that's 30 m off
+    /// won't intersect the user's actual location at all.
+    ///
+    /// Scaling to `accuracy × 2` gives ≈95 % confidence the search circle
+    /// covers the real position, while keeping the radius tight (10 m) when
+    /// the fix is good (≤ 5 m accuracy).  Capped at 100 m.
     var effectiveRadius: Double {
         guard let location = currentLocation else { return 10.0 }
-        if location.horizontalAccuracy > 50 {
-            return max(10.0, location.horizontalAccuracy * 1.5)
-        }
-        return 10.0
+        return min(100.0, max(10.0, location.horizontalAccuracy * 2.0))
     }
 
     // MARK: - Callbacks
@@ -136,15 +141,21 @@ final class LocationService {
             }
         }
 
-        // Check if we've moved far enough from last query to warrant a new one
+        // Check if we've moved far enough from last query to warrant a new one.
+        // GPS jitter filter: require the distance to exceed the combined accuracy
+        // of both readings.  Without this, a static device with 5 m accuracy
+        // continuously reports 5-9 m of "movement", triggering re-queries that
+        // swap feed content in and out.
         if let lastQuery = lastQueryLocation {
             let distanceFromLastQuery = current.distance(from: lastQuery)
-            if distanceFromLastQuery >= movementThreshold {
-                FeedDebugLogger.log(.loc, "significantMovement — \(String(format: "%.1f", distanceFromLastQuery))m from last query → re-querying")
+            let accuracyFloor = lastQuery.horizontalAccuracy + current.horizontalAccuracy
+            let effectiveThreshold = max(movementThreshold, accuracyFloor)
+            if distanceFromLastQuery >= effectiveThreshold {
+                FeedDebugLogger.log(.loc, "significantMovement — \(String(format: "%.1f", distanceFromLastQuery))m from last query (threshold=\(String(format: "%.1f", effectiveThreshold))m) → re-querying")
                 lastQueryLocation = current
                 onSignificantMovement?()
             } else {
-                FeedDebugLogger.log(.loc, "movement — \(String(format: "%.1f", distanceFromLastQuery))m from last query (below threshold)")
+                FeedDebugLogger.log(.loc, "movement — \(String(format: "%.1f", distanceFromLastQuery))m from last query (below accuracy-aware threshold \(String(format: "%.1f", effectiveThreshold))m)")
             }
         } else {
             FeedDebugLogger.log(.loc, "significantMovement — first query location set")
@@ -164,11 +175,24 @@ final class LocationService {
     private func startPeriodicQueryTimer() {
         periodicQueryTimer = Timer.scheduledTimer(withTimeInterval: queryInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
-                if self.movementState == .moving {
+                guard let self, self.movementState == .moving else { return }
+
+                // Same accuracy-aware gate as handleMovement: don't re-query
+                // if we haven't genuinely moved since the last query.
+                if let current = self.currentLocation, let lastQuery = self.lastQueryLocation {
+                    let distance = current.distance(from: lastQuery)
+                    let accuracyFloor = lastQuery.horizontalAccuracy + current.horizontalAccuracy
+                    let effectiveThreshold = max(self.movementThreshold, accuracyFloor)
+                    guard distance >= effectiveThreshold else {
+                        FeedDebugLogger.log(.loc, "⏱ periodicQuery — \(self.queryInterval)s timer fired but \(String(format: "%.1f", distance))m < accuracy-aware threshold \(String(format: "%.1f", effectiveThreshold))m → skipping")
+                        return
+                    }
+                    FeedDebugLogger.log(.loc, "⏱ periodicQuery — \(self.queryInterval)s timer fired, \(String(format: "%.1f", distance))m from last query → re-querying")
+                    self.lastQueryLocation = current
+                } else {
                     FeedDebugLogger.log(.loc, "⏱ periodicQuery — \(self.queryInterval)s timer fired (state=moving)")
-                    self.onSignificantMovement?()
                 }
+                self.onSignificantMovement?()
             }
         }
     }
