@@ -5,11 +5,11 @@
 //  The feed tab — full-screen, location-gated content display.
 //
 //  Interactions (per spec Section 9):
-//  - Vertical swipe up/down: navigate content with TikTok-style finger tracking
+//  - Vertical swipe up/down: UICollectionView pager with deterministic snap
 //  - Press and hold: pause all playback and auto-advance
 //  - Tap: toggle mute (video only)
 //  - 6-second auto-advance with yellow progress bar in tab bar
-//  - Pull-to-refresh at first item
+//  - Pull-to-refresh (smart — won't reload identical content)
 //  - Report, block, and share actions
 //
 
@@ -23,21 +23,6 @@ struct FeedView: View {
     @State private var showBlockConfirm = false
     @State private var blockItem: ContentItem?
     @State private var showBlockedBanner = false
-
-    // TikTok-style scroll state
-    @State private var dragOffset: CGFloat = 0
-    @State private var isTransitioning = false
-
-    // Hold-to-pause state (auto-resets when gesture ends)
-    @GestureState private var isLongPressing = false
-
-    // EndOfFeed drag state
-    @State private var endOfFeedDragOffset: CGFloat = 0
-
-    // Constants
-    private let pullThreshold: CGFloat = 100
-    private let swipeThreshold: CGFloat = 50
-    private let animationDuration: Double = 0.3
 
     var onMakeContent: () -> Void = {}
 
@@ -56,10 +41,27 @@ struct FeedView: View {
                     EmptyFeedView(onMakeContent: onMakeContent)
 
                 case .content:
-                    contentView
+                    FeedPagerView(
+                        viewModel: viewModel,
+                        appState: appState,
+                        onReport: { item in
+                            reportContentId = item.id
+                            showReport = true
+                        },
+                        onBlock: { item in
+                            blockItem = item
+                            showBlockConfirm = true
+                        },
+                        onShare: { item in
+                            shareContent(item)
+                        }
+                    )
+                    .ignoresSafeArea()
 
                 case .endOfFeed:
-                    endOfFeedWithGesture
+                    // Hard-stop at last item — this state should not be reached
+                    // from the pager flow, but kept for safety.
+                    EmptyView()
 
                 case .error(let message):
                     errorView(message)
@@ -80,12 +82,64 @@ struct FeedView: View {
                 .transition(.move(edge: .bottom))
             }
 
+            // End-of-feed alert — overlays on top of still-playing content
+            if viewModel.showEndOfFeedAlert {
+                Color.black.opacity(0.55)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        viewModel.dismissEndOfFeedAlert()
+                    }
+
+                RetroWindow(
+                    title: "ALERT",
+                    icon: .caution,
+                    showCloseBox: true,
+                    onClose: { viewModel.dismissEndOfFeedAlert() }
+                ) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("NO MORE LOCAL CONTENT")
+                            .font(NCFont.display(16))
+                            .foregroundColor(NCColor.ink)
+                            .textCase(.uppercase)
+                            .tracking(0.5)
+
+                        Text("You've reached the end. Make something or move somewhere new.")
+                            .font(NCFont.dialogBody)
+                            .foregroundColor(NCColor.ink)
+                            .lineSpacing(4)
+
+                        HStack(spacing: 12) {
+                            Spacer()
+                            RetroButton(
+                                title: "REFRESH",
+                                variant: .secondary,
+                                trailingIcon: .recycle
+                            ) {
+                                viewModel.refreshFeedFromAlert()
+                            }
+                            RetroButton(
+                                title: "MAKE CONTENT",
+                                variant: .primary
+                            ) {
+                                viewModel.dismissEndOfFeedAlert()
+                                onMakeContent()
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+                    .padding(NCMetrics.dialogPadding)
+                }
+                .padding(.horizontal, 32)
+                .transition(.move(edge: .bottom))
+            }
+
             // Blocked banner
             if showBlockedBanner {
                 blockedBanner
             }
         }
         .animation(.linear(duration: 0.2), value: showReport)
+        .animation(.linear(duration: 0.2), value: viewModel.showEndOfFeedAlert)
         .onAppear {
             viewModel.startFeed()
             AnalyticsService.shared.track(.feedOpened)
@@ -99,14 +153,8 @@ struct FeedView: View {
         .onChange(of: viewModel.isPaused) { _, newValue in
             appState.isFeedPaused = newValue
         }
-        .onChange(of: isLongPressing) { _, pressing in
-            viewModel.setPaused(pressing)
-        }
         .onChange(of: viewModel.feedState) { _, newState in
-            if newState != .content {
-                dragOffset = 0
-                isTransitioning = false
-            }
+            // No drag state to reset — pager handles its own scroll state
         }
         .retroDialog(isPresented: $showBlockConfirm) {
             RetroDialog(
@@ -145,250 +193,6 @@ struct FeedView: View {
         }
     }
 
-    // MARK: - Content View (TikTok-style vertical scroll)
-
-    private var contentView: some View {
-        GeometryReader { geometry in
-            let screenHeight = geometry.size.height
-
-            ZStack {
-                // Pull-to-refresh background and indicator (above first item)
-                if viewModel.currentIndex == 0 && dragOffset > 0 {
-                    pullToRefreshArea(in: geometry)
-                }
-
-                // Previous item peeking above
-                if viewModel.currentIndex > 0 {
-                    peekCard(for: viewModel.items[viewModel.currentIndex - 1], in: geometry)
-                        .frame(width: geometry.size.width, height: screenHeight)
-                        .offset(y: dragOffset - screenHeight)
-                }
-
-                // Current item
-                if let item = viewModel.currentItem {
-                    ContentCardView(
-                        item: item,
-                        isMuted: viewModel.isMuted,
-                        isPaused: viewModel.isPaused,
-                        currentUserId: appState.userId,
-                        onToggleMute: { viewModel.toggleMute() },
-                        onReport: {
-                            reportContentId = item.id
-                            showReport = true
-                        },
-                        onBlock: {
-                            blockItem = item
-                            showBlockConfirm = true
-                        },
-                        onShare: {
-                            shareContent(item)
-                        }
-                    )
-                    .id(item.id)
-                    .frame(width: geometry.size.width, height: screenHeight)
-                    .offset(y: dragOffset)
-                }
-
-                // Next item or EndOfFeed peeking below
-                if viewModel.currentIndex < viewModel.items.count - 1 {
-                    peekCard(for: viewModel.items[viewModel.currentIndex + 1], in: geometry)
-                        .frame(width: geometry.size.width, height: screenHeight)
-                        .offset(y: dragOffset + screenHeight)
-                } else {
-                    EndOfFeedView(
-                        onMakeContent: onMakeContent,
-                        onRefresh: { viewModel.refresh() }
-                    )
-                    .frame(width: geometry.size.width, height: screenHeight)
-                    .offset(y: dragOffset + screenHeight)
-                }
-            }
-        }
-        .clipped()
-        .gesture(swipeGesture)
-        .simultaneousGesture(holdGesture)
-    }
-
-    // MARK: - Peek Card (lightweight preview for adjacent items)
-
-    @ViewBuilder
-    private func peekCard(for item: ContentItem, in geometry: GeometryProxy) -> some View {
-        ZStack {
-            Color.black
-            if item.contentType == .image, let url = item.signedURL {
-                AsyncImage(url: url) { phase in
-                    if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: geometry.size.width, height: geometry.size.height)
-                            .clipped()
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: - Pull-to-Refresh Area
-
-    private func pullToRefreshArea(in geometry: GeometryProxy) -> some View {
-        let screenHeight = geometry.size.height
-        let progress = min(dragOffset / (pullThreshold * 0.5), 1.5)
-
-        return ZStack {
-            // Dither background for the revealed gap
-            DitherPatternView(
-                style: .light,
-                foreground: NCColor.dither,
-                background: NCColor.background,
-                animated: true
-            )
-
-            // Hourglass indicator
-            VStack(spacing: 8) {
-                PixelIcon(type: .hourglass, size: 28, color: NCColor.ink)
-                    .rotationEffect(.degrees(progress * 180))
-                    .scaleEffect(0.5 + min(progress, 1.0) * 0.5)
-
-                if progress >= 1.0 {
-                    Text("RELEASE TO REFRESH")
-                        .font(NCFont.caption)
-                        .foregroundColor(NCColor.ink)
-                        .tracking(0.3)
-                        .transition(.opacity)
-                }
-            }
-        }
-        .frame(width: geometry.size.width, height: max(1, dragOffset))
-        .offset(y: -(screenHeight - dragOffset) / 2)
-    }
-
-    // MARK: - Swipe Gesture (TikTok-style finger tracking)
-
-    private var swipeGesture: some Gesture {
-        DragGesture(minimumDistance: 20, coordinateSpace: .local)
-            .onChanged { value in
-                guard !isTransitioning else { return }
-                let translation = value.translation.height
-
-                if viewModel.currentIndex == 0 && translation > 0 {
-                    // Pull-to-refresh: rubber band effect at top
-                    dragOffset = translation * 0.5
-                } else {
-                    dragOffset = translation
-                }
-            }
-            .onEnded { value in
-                guard !isTransitioning else { return }
-                let translation = value.translation.height
-                let velocity = value.predictedEndTranslation.height - translation
-                let screenHeight = UIScreen.main.bounds.height
-
-                // Pull-to-refresh (at first item, pulled past threshold)
-                if viewModel.currentIndex == 0 && translation > pullThreshold {
-                    withAnimation(.easeOut(duration: animationDuration)) {
-                        dragOffset = 0
-                    }
-                    viewModel.refresh()
-                    return
-                }
-
-                let shouldAdvance = translation < -swipeThreshold || velocity < -300
-                let shouldGoBack = translation > swipeThreshold || velocity > 300
-
-                if shouldAdvance {
-                    isTransitioning = true
-                    withAnimation(.easeOut(duration: animationDuration)) {
-                        dragOffset = -screenHeight
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
-                        viewModel.advanceToNext()
-                        if viewModel.feedState == .content {
-                            dragOffset = 0
-                            viewModel.startAutoAdvance()
-                        }
-                        isTransitioning = false
-                    }
-                } else if shouldGoBack && viewModel.currentIndex > 0 {
-                    isTransitioning = true
-                    withAnimation(.easeOut(duration: animationDuration)) {
-                        dragOffset = screenHeight
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
-                        viewModel.goToPrevious()
-                        dragOffset = 0
-                        viewModel.startAutoAdvance()
-                        isTransitioning = false
-                    }
-                } else {
-                    // Snap back — didn't meet threshold
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        dragOffset = 0
-                    }
-                }
-            }
-    }
-
-    // MARK: - Hold Gesture (press and hold to pause everything)
-
-    private var holdGesture: some Gesture {
-        LongPressGesture(minimumDuration: 0.3)
-            .sequenced(before: DragGesture(minimumDistance: 0))
-            .updating($isLongPressing) { value, state, _ in
-                switch value {
-                case .second(true, _):
-                    state = true
-                default:
-                    break
-                }
-            }
-    }
-
-    // MARK: - EndOfFeed with Gesture (swipe to return to content)
-
-    private var endOfFeedWithGesture: some View {
-        EndOfFeedView(
-            onMakeContent: onMakeContent,
-            onRefresh: { viewModel.refresh() }
-        )
-        .offset(y: endOfFeedDragOffset)
-        .gesture(
-            DragGesture(minimumDistance: 50)
-                .onChanged { value in
-                    endOfFeedDragOffset = value.translation.height
-                }
-                .onEnded { value in
-                    let translation = value.translation.height
-                    let screenHeight = UIScreen.main.bounds.height
-
-                    if translation > 80 && !viewModel.items.isEmpty {
-                        // Swipe down (top to bottom) → go to last content item
-                        withAnimation(.easeOut(duration: animationDuration)) {
-                            endOfFeedDragOffset = screenHeight
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
-                            endOfFeedDragOffset = 0
-                            viewModel.goToLast()
-                        }
-                    } else if translation < -80 && !viewModel.items.isEmpty {
-                        // Swipe up (bottom to top) → go to first content item
-                        withAnimation(.easeOut(duration: animationDuration)) {
-                            endOfFeedDragOffset = -screenHeight
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
-                            endOfFeedDragOffset = 0
-                            viewModel.goToFirst()
-                        }
-                    } else {
-                        // Snap back
-                        withAnimation(.easeOut(duration: animationDuration)) {
-                            endOfFeedDragOffset = 0
-                        }
-                    }
-                }
-        )
-    }
-
     // MARK: - Block
 
     private func performBlock(userId: UUID) {
@@ -400,11 +204,13 @@ struct FeedView: View {
                     blockItem = nil
                     // Remove blocked user's content from feed and advance
                     viewModel.items.removeAll { $0.userId == userId }
+                    viewModel.mediaPreloader.setItems(viewModel.items)
                     if viewModel.items.isEmpty {
                         viewModel.feedState = .empty
                     } else if viewModel.currentIndex >= viewModel.items.count {
                         viewModel.currentIndex = max(0, viewModel.items.count - 1)
                     }
+                    viewModel.mediaPreloader.updateBuffer(around: viewModel.currentIndex)
                     showBlockedBanner = true
                 }
             } catch {
