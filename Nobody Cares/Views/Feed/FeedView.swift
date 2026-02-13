@@ -38,7 +38,11 @@ struct FeedView: View {
                     LoadingFeedView()
 
                 case .empty:
-                    EmptyFeedView(onMakeContent: onMakeContent)
+                    EmptyFeedView(
+                        isRefreshing: viewModel.isEmptyRefreshing,
+                        onMakeContent: onMakeContent,
+                        onRefresh: { viewModel.refreshFromEmptyState() }
+                    )
 
                 case .content:
                     FeedPagerView(

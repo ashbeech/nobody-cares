@@ -68,6 +68,7 @@ final class FeedViewModel {
     var isRefreshing: Bool = false
     var isTimerPaused: Bool = false
     var showEndOfFeedAlert: Bool = false
+    var isEmptyRefreshing: Bool = false
 
     /// Per-item range states for proximity overlays. Published so the pager can observe.
     var itemRangeStates: [UUID: RangeState] = [:]
@@ -123,6 +124,13 @@ final class FeedViewModel {
     let exitRadiusMeters: Double = 20.0   // 8m buffer above enter
     let exitHoldSeconds: TimeInterval = 12.0  // must stay beyond exit for 12s before removal
 
+    /// Ingress threshold — items from the server must be within this distance to enter the feed.
+    /// Deliberately wider than exitRadiusMeters so that GPS jitter (easily 6-8m swings in urban
+    /// areas) doesn't cause items to fail ingress that the range state machine would comfortably
+    /// keep. The range state machine handles actual proximity gating with proper hysteresis
+    /// (confirmations + grace period), so this is just a coarse first-pass filter.
+    let ingressRadiusMeters: Double = 30.0
+
     /// Confirmations required before transitioning inRange → gracePeriod.
     private let exitConfirmationsRequired = 3
     private let exitConfirmationsRequiredStationary = 5
@@ -150,7 +158,13 @@ final class FeedViewModel {
     func startFeed() {
         FeedDebugLogger.log(.feed, "startFeed() called — setting state to .loading")
         feedState = .loading
-        sessionMaxRadius = 10.0
+        // Preserve sessionMaxRadius across brief stop/start cycles (e.g. tab switch,
+        // background/foreground). Resetting to 10m causes the first query to miss content
+        // that was just being viewed at a wider radius. Only reset on a genuinely fresh
+        // start (no items loaded from a previous session).
+        if items.isEmpty {
+            sessionMaxRadius = 10.0
+        }
         hasCompletedInitialRefresh = false
         recentLocations = []
         smoothedLocation = nil
@@ -531,10 +545,10 @@ final class FeedViewModel {
             let hadContent = !items.isEmpty
             let allItems = feedDataService.items
 
-            // Filter: only include items within exit radius (server-reported distance).
-            // Items beyond this are not eligible for the feed — no point showing them
-            // just to immediately mark them "WALKED AWAY".
-            let eligible = allItems.filter { $0.distanceMeters <= exitRadiusMeters }
+            // Filter: only include items within ingress radius (server-reported distance).
+            // This is wider than exitRadiusMeters to absorb GPS jitter — the range state
+            // machine handles actual proximity gating with hysteresis + confirmations.
+            let eligible = allItems.filter { $0.distanceMeters <= ingressRadiusMeters }
 
             FeedDebugLogger.log(.feed, "refreshFromLocation — GOT \(allItems.count) items, \(eligible.count) eligible (had \(items.count))", detail: "hadContent=\(hadContent)")
             for (i, item) in allItems.enumerated() {
@@ -543,7 +557,7 @@ final class FeedViewModel {
             }
 
             if eligible.isEmpty {
-                // All server items are beyond exit radius
+                // All server items are beyond ingress radius
                 if hadContent {
                     FeedDebugLogger.log(.feed, "refreshFromLocation — no eligible items, clearing feed")
                     items = []
@@ -639,13 +653,13 @@ final class FeedViewModel {
                     radius: radius
                 )
 
-                // Filter to eligible items (within exit radius by server-reported distance)
-                let eligible = allItems.filter { $0.distanceMeters <= exitRadiusMeters }
+                // Filter to eligible items (within ingress radius by server-reported distance)
+                let eligible = allItems.filter { $0.distanceMeters <= ingressRadiusMeters }
                 let existingIds = items.map(\.id)
                 let eligibleIds = eligible.map(\.id)
 
                 if eligible.isEmpty {
-                    FeedDebugLogger.log(.feed, "smartRefresh — EMPTY (all \(allItems.count) items beyond exit radius)")
+                    FeedDebugLogger.log(.feed, "smartRefresh — EMPTY (all \(allItems.count) items beyond ingress radius)")
                     items = []
                     mediaPreloader.cancelAll()
                     cancelAllExitTimers()
@@ -934,6 +948,19 @@ final class FeedViewModel {
         }
     }
 
+    /// Trigger a proximity re-check from the empty state.
+    /// Does NOT flash .loading — keeps the empty view visible while checking.
+    func refreshFromEmptyState() {
+        guard !isEmptyRefreshing else { return }
+        FeedDebugLogger.log(.feed, "refreshFromEmptyState — user-triggered re-check from empty state")
+        isEmptyRefreshing = true
+
+        Task { @MainActor in
+            defer { isEmptyRefreshing = false }
+            await refreshFromLocation()
+        }
+    }
+
     @MainActor
     private func performRefreshFetch(latitude: Double, longitude: Double) async {
         let radius = queryRadius()
@@ -946,7 +973,7 @@ final class FeedViewModel {
             )
 
             // Filter to eligible items
-            let eligible = allItems.filter { $0.distanceMeters <= exitRadiusMeters }
+            let eligible = allItems.filter { $0.distanceMeters <= ingressRadiusMeters }
 
             if eligible.isEmpty {
                 // User explicitly triggered this refresh — accept the empty result
@@ -1003,7 +1030,7 @@ final class FeedViewModel {
             radius: queryRadius()
         )
         if feedDataService.items.count > items.count {
-            let eligible = feedDataService.items.filter { $0.distanceMeters <= exitRadiusMeters }
+            let eligible = feedDataService.items.filter { $0.distanceMeters <= ingressRadiusMeters }
             guard eligible.count > items.count else { return }
             mediaPreloader.setItems(eligible)
             items = eligible
