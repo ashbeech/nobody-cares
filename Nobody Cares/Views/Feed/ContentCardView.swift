@@ -205,7 +205,7 @@ struct ContentCardView: View {
     private var loadingPlaceholder: some View {
         ZStack {
             Color.black
-            PixelIcon(type: .hourglass, size: 32, color: .white)
+            HourglassLoader(size: 32, color: .white)
         }
     }
 

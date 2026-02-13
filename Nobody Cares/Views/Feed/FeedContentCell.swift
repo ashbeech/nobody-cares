@@ -43,20 +43,9 @@ final class FeedContentCell: UICollectionViewCell {
         return v
     }()
 
-    private let loadingSpinner: UIActivityIndicatorView = {
-        let s = UIActivityIndicatorView(style: .large)
-        s.color = .white
-        s.hidesWhenStopped = true
+    private let loadingSpinner: HourglassLoaderUIView = {
+        let s = HourglassLoaderUIView(size: 32, color: .white)
         return s
-    }()
-
-    private let loadingLabel: UILabel = {
-        let l = UILabel()
-        l.text = "LOADING…"
-        l.textColor = .white
-        l.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        l.textAlignment = .center
-        return l
     }()
 
     // MARK: - Out-of-Range Overlay
@@ -120,7 +109,6 @@ final class FeedContentCell: UICollectionViewCell {
         playerView.translatesAutoresizingMaskIntoConstraints = false
         loadingContainer.translatesAutoresizingMaskIntoConstraints = false
         loadingSpinner.translatesAutoresizingMaskIntoConstraints = false
-        loadingLabel.translatesAutoresizingMaskIntoConstraints = false
         outOfRangeContainer.translatesAutoresizingMaskIntoConstraints = false
         walkedAwayLabel.translatesAutoresizingMaskIntoConstraints = false
         moveCloserLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -130,7 +118,6 @@ final class FeedContentCell: UICollectionViewCell {
         contentView.addSubview(playerView)
         contentView.addSubview(loadingContainer)
         loadingContainer.addSubview(loadingSpinner)
-        loadingContainer.addSubview(loadingLabel)
         contentView.addSubview(outOfRangeContainer)
         outOfRangeContainer.addSubview(walkedAwayLabel)
         outOfRangeContainer.addSubview(moveCloserLabel)
@@ -155,9 +142,7 @@ final class FeedContentCell: UICollectionViewCell {
             loadingContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             loadingContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             loadingSpinner.centerXAnchor.constraint(equalTo: loadingContainer.centerXAnchor),
-            loadingSpinner.centerYAnchor.constraint(equalTo: loadingContainer.centerYAnchor, constant: -12),
-            loadingLabel.topAnchor.constraint(equalTo: loadingSpinner.bottomAnchor, constant: 8),
-            loadingLabel.centerXAnchor.constraint(equalTo: loadingContainer.centerXAnchor),
+            loadingSpinner.centerYAnchor.constraint(equalTo: loadingContainer.centerYAnchor),
 
             // Out-of-range overlay (full screen)
             outOfRangeContainer.topAnchor.constraint(equalTo: contentView.topAnchor),
@@ -194,11 +179,7 @@ final class FeedContentCell: UICollectionViewCell {
         // Update loading overlay
         let showLoading = !isReady && contentType == .video && rangeState != .outOfRange
         loadingContainer.isHidden = !showLoading
-        if showLoading {
-            loadingSpinner.startAnimating()
-        } else {
-            loadingSpinner.stopAnimating()
-        }
+        loadingSpinner.isHidden = !showLoading
 
         // Update out-of-range overlay
         outOfRangeContainer.isHidden = rangeState != .outOfRange
@@ -267,7 +248,7 @@ final class FeedContentCell: UICollectionViewCell {
         imageView.image = MediaPreloader.placeholder
 
         loadingContainer.isHidden = true
-        loadingSpinner.stopAnimating()
+        loadingSpinner.isHidden = true
         outOfRangeContainer.isHidden = true
         gracePeriodLabel.isHidden = true
 

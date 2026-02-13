@@ -160,7 +160,7 @@ struct SettingsView: View {
 
                 if isCheckingLocation {
                     HStack(spacing: 8) {
-                        PixelIcon(type: .hourglass, size: 14)
+                        HourglassLoader(size: 14, color: NCColor.inkSecondary)
                         Text("CHECKING LOCATION...")
                             .font(NCFont.caption)
                             .foregroundColor(NCColor.inkSecondary)

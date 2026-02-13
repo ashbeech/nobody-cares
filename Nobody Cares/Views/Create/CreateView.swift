@@ -403,7 +403,7 @@ struct CreateView: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 16) {
-                PixelIcon(type: .hourglass, size: 32, color: .white)
+                HourglassLoader(size: 32, color: .white)
 
                 Text("ARCHIVING CONTENT...")
                     .font(NCFont.display(14))

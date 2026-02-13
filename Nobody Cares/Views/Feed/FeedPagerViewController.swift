@@ -58,6 +58,7 @@ final class FeedPagerViewController: UIViewController {
 
     private(set) var collectionView: UICollectionView!
     private let refreshControl = UIRefreshControl()
+    private let refreshHourglass = HourglassLoaderUIView(size: 28, color: .white)
 
     // MARK: - Snap Constants
 
@@ -148,9 +149,19 @@ final class FeedPagerViewController: UIViewController {
     }
 
     private func setupRefreshControl() {
-        refreshControl.tintColor = .white
+        // Hide the default system spinner
+        refreshControl.tintColor = .clear
         refreshControl.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
         collectionView.refreshControl = refreshControl
+
+        // Add hourglass loader as custom refresh indicator
+        refreshHourglass.translatesAutoresizingMaskIntoConstraints = false
+        refreshHourglass.isHidden = true
+        refreshControl.addSubview(refreshHourglass)
+        NSLayoutConstraint.activate([
+            refreshHourglass.centerXAnchor.constraint(equalTo: refreshControl.centerXAnchor),
+            refreshHourglass.centerYAnchor.constraint(equalTo: refreshControl.centerYAnchor),
+        ])
     }
 
     private func setupLongPressGesture() {
@@ -283,6 +294,7 @@ final class FeedPagerViewController: UIViewController {
 
     func endRefreshing() {
         refreshControl.endRefreshing()
+        refreshHourglass.isHidden = true
     }
 
     /// Update range states and refresh all visible cells to reflect proximity changes.
@@ -318,6 +330,7 @@ final class FeedPagerViewController: UIViewController {
 
     @objc private func handleRefresh() {
         FeedDebugLogger.log(.pager, "handleRefresh — pull-to-refresh triggered")
+        refreshHourglass.isHidden = false
         onRefresh?()
     }
 
