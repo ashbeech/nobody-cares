@@ -176,8 +176,15 @@ final class FeedContentCell: UICollectionViewCell {
         // Always set a non-nil image — thumbnail, cached, or placeholder
         imageView.image = preloadedImage ?? MediaPreloader.placeholder
 
-        // Update loading overlay
-        let showLoading = !isReady && contentType == .video && rangeState != .outOfRange
+        // Update loading overlay.
+        // For images, the content is effectively ready once we have the actual
+        // image data (which may come from thumbnailCache even after readiness
+        // was cleared by buffer eviction). Identity check against the static
+        // placeholder distinguishes "real content" from "not yet loaded".
+        let imageAlreadyLoaded = contentType == .image
+            && preloadedImage != nil
+            && preloadedImage !== MediaPreloader.placeholder
+        let showLoading = !isReady && !imageAlreadyLoaded && rangeState != .outOfRange
         loadingContainer.isHidden = !showLoading
         loadingSpinner.isHidden = !showLoading
 
