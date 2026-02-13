@@ -29,7 +29,6 @@ struct OnboardingView: View {
     @State private var step: OnboardingStep = .welcome
     @State private var isProcessing = false
     @State private var loadingMessage: String = ""
-    @State private var hourglassFlipped = false
     @State private var errorMessage: String?
     @State private var showError = false
 
@@ -253,13 +252,7 @@ struct OnboardingView: View {
     private var onboardingLoadingView: some View {
         RetroWindow(title: "PROCESSING") {
             VStack(spacing: 20) {
-                PixelIcon(
-                    type: .hourglass,
-                    size: 36,
-                    color: NCColor.ink
-                )
-                .rotationEffect(.degrees(hourglassFlipped ? 180 : 0))
-                .onAppear { startHourglassAnimation() }
+                HourglassLoader(size: 36, color: NCColor.ink)
 
                 Text(loadingMessage)
                     .font(NCFont.dialogBody)
@@ -271,12 +264,6 @@ struct OnboardingView: View {
             .frame(maxWidth: .infinity)
             .padding(NCMetrics.dialogPadding)
             .padding(.vertical, 8)
-        }
-    }
-
-    private func startHourglassAnimation() {
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
-            hourglassFlipped.toggle()
         }
     }
 
