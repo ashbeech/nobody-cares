@@ -40,12 +40,15 @@ struct MainShell: View {
             if appState.showArchivedBanner {
                 archivedBanner
             }
-        }
-        .sheet(isPresented: $state.showSettings) {
-            SettingsView()
-                .onAppear {
-                    AnalyticsService.shared.track(.settingsOpened)
-                }
+
+            // Settings
+            if state.showSettings {
+                SettingsView()
+                    .zIndex(100)
+                    .onAppear {
+                        AnalyticsService.shared.track(.settingsOpened)
+                    }
+            }
         }
         // Deep link dialog
         .overlay {
