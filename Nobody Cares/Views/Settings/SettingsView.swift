@@ -18,13 +18,16 @@ struct SettingsView: View {
     @Environment(AppState.self) private var appState
     @Environment(AuthService.self) private var authService
     @Environment(PermissionService.self) private var permissionService
-    @Environment(\.dismiss) private var dismiss
     @State private var showDeleteConfirm = false
     @State private var isRegenerating = false
     @State private var isCheckingLocation = false
     @State private var canDeleteLocally = false
     @State private var deletionLocationError: String?
     @State private var showMailError = false
+    @State private var dragOffset: CGFloat = 0
+    @State private var scrolledToTop = true
+    @State private var isDragging = false
+    @State private var appeared = false
 
     var body: some View {
         ZStack {
@@ -42,9 +45,58 @@ struct SettingsView: View {
                         versionLabel
                     }
                     .padding(NCMetrics.contentPadding)
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.preference(
+                                key: ScrollOffsetKey.self,
+                                value: geo.frame(in: .named("settingsScroll")).minY
+                            )
+                        }
+                    )
                 }
+                .coordinateSpace(name: "settingsScroll")
+                .onPreferenceChange(ScrollOffsetKey.self) { value in
+                    scrolledToTop = value >= -1
+                }
+                .scrollDisabled(isDragging)
             }
         }
+        .offset(y: appeared ? dragOffset : UIScreen.main.bounds.height)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.5)) {
+                appeared = true
+            }
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 10)
+                .onChanged { value in
+                    if !isDragging && scrolledToTop && value.translation.height > 10 {
+                        isDragging = true
+                    }
+                    if isDragging {
+                        dragOffset = max(0, value.translation.height)
+                    }
+                }
+                .onEnded { value in
+                    guard isDragging else { return }
+                    if dragOffset > 150 || value.predictedEndTranslation.height > 300 {
+                        withAnimation(.easeOut(duration: 0.3)) {
+                            dragOffset = UIScreen.main.bounds.height
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            appState.showSettings = false
+                            dragOffset = 0
+                            isDragging = false
+                            appeared = false
+                        }
+                    } else {
+                        withAnimation(.spring()) {
+                            dragOffset = 0
+                        }
+                        isDragging = false
+                    }
+                }
+        )
         .task {
             await checkDeletionEligibility()
         }
@@ -91,7 +143,7 @@ struct SettingsView: View {
                 .background(NCColor.background)
 
             HStack {
-                RetroCloseBox { dismiss() }
+                RetroCloseBox { dismissSettings() }
                     .padding(.leading, 12)
                 Spacer()
             }
@@ -217,6 +269,19 @@ struct SettingsView: View {
             .padding(.top, 8)
     }
 
+    // MARK: - Dismiss
+
+    private func dismissSettings() {
+        withAnimation(.easeInOut(duration: 0.5)) {
+            appeared = false
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            appState.showSettings = false
+            dragOffset = 0
+            isDragging = false
+        }
+    }
+
     // MARK: - Geo-locked Deletion Check
 
     private func checkDeletionEligibility() async {
@@ -285,7 +350,7 @@ struct SettingsView: View {
             appState.hasCompletedOnboarding = false
             appState.isAuthenticated = false
             showDeleteConfirm = false
-            dismiss()
+            appState.showSettings = false
         }
     }
 
@@ -312,6 +377,13 @@ struct SettingsView: View {
 }
 
 import CoreLocation
+
+private struct ScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
 
 #Preview("Settings") {
     SettingsView()
